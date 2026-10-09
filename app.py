@@ -75,7 +75,7 @@ DAYS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Doming
 AREAS = ["atencion", "barra", "cocina", "Omitir"]
 AREA_PCT = {"atencion": 0.70, "cocina": 0.20, "barra": 0.10}
 AREA_ORDER = ["atencion", "cocina", "barra"]
-TURNO_ORDER = {"Día": 0, "Noche": 1, "Único": 2}
+TURNO_ORDER = {"Día": 0, "Noche": 1, "Único": 2, "Día completo": 3}
 
 
 # ============================================================================
@@ -435,12 +435,29 @@ def hhmm(sec: int) -> str:
     return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}"
 
 
-def compute(marks, areas: dict, single: bool, cut_sec: int, tips: dict) -> dict:
+def compute(marks, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
+    """
+    modes[i] = True  -> el día i (0 = Lunes) está en Modo Pozo Único.
+    modes[i] = False -> el día i está en Modo Turnos (Día / Noche según la hora de corte).
+
+    Reglas de reparto:
+      * atención (70%) y barra (10%): por turno en Modo Turnos; por día entero en Pozo Único.
+      * cocina (20%): SIEMPRE por día entero, sobre el pozo total del día (Día + Noche o Pozo Único).
+    """
     active = {n: a for n, a in areas.items() if a != "Omitir"}
     if not marks:
         raise ValueError("Primero sube el archivo Excel con las horas.")
     if not active:
         raise ValueError('Todos los trabajadores están en "Omitir". Asigna un área al menos a uno.')
+
+    def day_total(wd: int) -> float:
+        return tips["unico"][wd] if modes[wd] else tips["dia"][wd] + tips["noche"][wd]
+
+    def pool_of(d: date, turno: str) -> float:
+        wd = d.weekday()
+        if turno == "Único":
+            return tips["unico"][wd]
+        return tips["dia"][wd] if turno == "Día" else tips["noche"][wd]
 
     warnings = []
 
@@ -450,13 +467,14 @@ def compute(marks, areas: dict, single: bool, cut_sec: int, tips: dict) -> dict:
         if name in active:
             by_pd[(name, d)].add(sec)
 
-    # 2) Emparejar marcas (entrada, salida) y repartir el tiempo entre turnos
+    # 2) Emparejar marcas (entrada, salida) y repartir el tiempo según el modo de cada día
     hours = defaultdict(float)  # (fecha, turno, nombre) -> horas
     for (name, d), times in sorted(by_pd.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        single_day = modes[d.weekday()]
         t = sorted(times)
         for i in range(0, len(t) - 1, 2):
             a, b = t[i], t[i + 1]
-            if single:
+            if single_day:
                 hours[(d, "Único", name)] += (b - a) / 3600
             else:
                 if min(b, cut_sec) - a > 0:
@@ -468,46 +486,65 @@ def compute(marks, areas: dict, single: bool, cut_sec: int, tips: dict) -> dict:
     if not hours:
         raise ValueError("No se pudieron calcular horas. Revisa que cada persona tenga entrada y salida por día.")
 
-    # 3) Horas por (fecha, turno, área)
-    area_hours = defaultdict(lambda: {"atencion": 0.0, "cocina": 0.0, "barra": 0.0})
-    for (d, turno, name), h in hours.items():
-        area_hours[(d, turno)][active[name]] += h
-
-    def pool_of(d, turno):
-        key = "unico" if turno == "Único" else ("dia" if turno == "Día" else "noche")
-        return tips[key][d.weekday()]
-
-    # 4) Reparto: Propina = (Horas_Persona / Total_Horas_Area) * (Pozo_Turno * Pct_Area)
-    rows = []
+    # 3) Horas por (fecha, turno, área) para atención y barra; horas por día para cocina
+    area_hours = defaultdict(lambda: {"atencion": 0.0, "barra": 0.0})
+    cocina_day = defaultdict(float)  # (fecha, nombre) -> horas del día completo
     for (d, turno, name), h in hours.items():
         area = active[name]
+        if area == "cocina":
+            cocina_day[(d, name)] += h
+        else:
+            area_hours[(d, turno)][area] += h
+    cocina_total = defaultdict(float)  # fecha -> horas totales de cocina
+    for (d, _name), h in cocina_day.items():
+        cocina_total[d] += h
+
+    # 4) Reparto proporcional
+    rows = []
+    # 4a) Atención y barra: por turno (o por día entero si el día es Pozo Único)
+    for (d, turno, name), h in hours.items():
+        area = active[name]
+        if area == "cocina":
+            continue
         total_area = area_hours[(d, turno)][area]
         tip = (h / total_area) * (pool_of(d, turno) * AREA_PCT[area]) if total_area > 0 else 0.0
         rows.append({"date": d, "turno": turno, "name": name, "area": area, "hours": h, "tip": tip})
+    # 4b) Cocina: siempre por día entero sobre el pozo total del día
+    for (d, name), h in cocina_day.items():
+        pool = day_total(d.weekday()) * AREA_PCT["cocina"]
+        tip = (h / cocina_total[d]) * pool if cocina_total[d] > 0 else 0.0
+        rows.append({"date": d, "turno": "Día completo", "name": name, "area": "cocina", "hours": h, "tip": tip})
     rows.sort(key=lambda r: (r["date"], TURNO_ORDER[r["turno"]], AREA_ORDER.index(r["area"]), r["name"].casefold()))
 
     # 5) Avisos por dinero sin repartir
     unassigned = 0.0
-    for (d, turno), ah in sorted(area_hours.items(), key=lambda kv: (kv[0][0], TURNO_ORDER[kv[0][1]])):
-        pool = pool_of(d, turno)
-        for area in AREA_ORDER:
-            share = pool * AREA_PCT[area]
-            if ah[area] == 0 and share > 0:
-                unassigned += share
-                warnings.append(
-                    f"{DAYS[d.weekday()]} {fmt_date(d)} ({turno}): nadie de {area} trabajó, quedan {money(share)} sin repartir."
-                )
-    present = {(d.weekday(), turno) for (d, turno) in area_hours}
+    dates_present = sorted({d for (d, _t, _n) in hours})
+    for d in dates_present:
+        wd = d.weekday()
+        label = f"{DAYS[wd]} {fmt_date(d)}"
+        for turno in (["Único"] if modes[wd] else ["Día", "Noche"]):
+            pool = pool_of(d, turno)
+            for area in ("atencion", "barra"):
+                share = pool * AREA_PCT[area]
+                if share > 0 and area_hours[(d, turno)][area] == 0:
+                    unassigned += share
+                    where = "ese día" if turno == "Único" else f"el turno {turno}"
+                    warnings.append(f"{label}: nadie de {area} trabajó {where}, quedan {money(share)} sin repartir.")
+        share = day_total(wd) * AREA_PCT["cocina"]
+        if share > 0 and cocina_total[d] == 0:
+            unassigned += share
+            warnings.append(f"{label}: nadie de cocina trabajó ese día, quedan {money(share)} sin repartir.")
+
+    present_wd = {d.weekday() for d in dates_present}
     for wd in range(7):
-        for turno in (["Único"] if single else ["Día", "Noche"]):
-            key = "unico" if turno == "Único" else ("dia" if turno == "Día" else "noche")
-            pool = tips[key][wd]
-            if pool > 0 and (wd, turno) not in present:
-                unassigned += pool
-                warnings.append(f"{DAYS[wd]} ({turno}): ingresaste {money(pool)} pero no hay horas registradas. Quedan sin repartir.")
+        total = day_total(wd)
+        if total > 0 and wd not in present_wd:
+            unassigned += total
+            warnings.append(f"{DAYS[wd]}: ingresaste {money(total)} pero no hay horas registradas. Quedan sin repartir.")
+
     dates_by_wd = defaultdict(set)
-    for r in rows:
-        dates_by_wd[r["date"].weekday()].add(r["date"])
+    for d in dates_present:
+        dates_by_wd[d.weekday()].add(d)
     for wd, ds in sorted(dates_by_wd.items()):
         if len(ds) > 1:
             warnings.append(
@@ -515,12 +552,11 @@ def compute(marks, areas: dict, single: bool, cut_sec: int, tips: dict) -> dict:
                 "carga una sola semana para evitar duplicar propinas."
             )
 
-    collected = sum(tips["unico"]) if single else sum(tips["dia"]) + sum(tips["noche"])
     return {
         "rows": rows,
         "warnings": warnings,
         "unassigned": unassigned,
-        "collected": collected,
+        "collected": sum(day_total(wd) for wd in range(7)),
         "distributed": sum(r["tip"] for r in rows),
         "total_hours": sum(r["hours"] for r in rows),
         "people": len({r["name"] for r in rows}),
@@ -601,14 +637,21 @@ def render_tool(user: dict):
 
     # ---- Sección 2
     st.subheader("2. Configuración de Turnos y Mapeo")
-    c1, c2 = st.columns(2)
-    with c1:
-        single = st.toggle("Modo Pozo Único (Festivos / Turno Único)", value=False, key="single",
-                           help="Todas las horas del día se reparten en un solo pozo.")
-    with c2:
-        cutoff = st.time_input("Hora de corte de turno", value=dtime(17, 30), key="cutoff",
-                               step=300, disabled=single,
-                               help="Antes de esta hora es turno Día; desde esta hora, turno Noche.")
+    all_single = all(st.session_state.get(f"single_{i}", False) for i in range(7))
+    cutoff = st.time_input("Hora de corte de turno", value=dtime(17, 30), key="cutoff",
+                           step=300, disabled=all_single,
+                           help="En los días en Modo Turnos: antes de esta hora es turno Día; desde esta hora, turno Noche.")
+
+    st.markdown("**Modo de cada día**")
+    st.caption(
+        "Desactivado = Modo Turnos (pozo de Día y pozo de Noche, según la hora de corte). "
+        "Activado = Modo Pozo Único (un solo pozo para todo el día, ideal para festivos)."
+    )
+    mode_cols = st.columns(4)
+    for i, day in enumerate(DAYS):
+        with mode_cols[i % 4]:
+            st.toggle(f"{day}: Pozo Único", value=False, key=f"single_{i}")
+    modes = [bool(st.session_state.get(f"single_{i}", False)) for i in range(7)]
 
     st.markdown("**Trabajadores encontrados**")
     areas = {}
@@ -630,7 +673,7 @@ def render_tool(user: dict):
 
     # ---- Sección 3
     st.subheader("3. Propinas Recaudadas ($)")
-    # Streamlit descarta el valor de widgets que dejan de dibujarse (al cambiar de modo); lo conservamos.
+    # Streamlit descarta el valor de widgets que dejan de dibujarse (al cambiar el modo de un día); lo conservamos.
     for k in [f"tip_{m}_{i}" for m in "udn" for i in range(7)]:
         if k in st.session_state:
             st.session_state[k] = st.session_state[k]
@@ -638,43 +681,51 @@ def render_tool(user: dict):
     def tip_input(label, key):
         return st.number_input(label, min_value=0, step=1000, value=0, format="%d", key=key)
 
-    if single:
-        st.caption("Ingresa el total recaudado en cada día. Se reparte entre todos los que trabajaron ese día.")
-        cols = st.columns(4)
-        for i, day in enumerate(DAYS):
-            with cols[i % 4]:
-                tip_input(day, f"tip_u_{i}")
-    else:
-        st.caption("Ingresa lo recaudado en cada turno.")
-        for i, day in enumerate(DAYS):
-            with st.expander(day, expanded=(i == 0)):
+    st.caption("Cada día muestra los campos que corresponden a su modo. Abre un día para ingresar sus pozos.")
+    for i, day in enumerate(DAYS):
+        with st.expander(day, expanded=(i == 0)):
+            if modes[i]:
+                st.caption("Modo Pozo Único: un solo pozo para todo el día.")
+                tip_input("Pozo del día", f"tip_u_{i}")
+            else:
+                st.caption(f"Modo Turnos: Día antes de las {cutoff:%H:%M}; Noche desde esa hora.")
                 a, b = st.columns(2)
                 with a:
                     tip_input("Turno Día", f"tip_d_{i}")
                 with b:
                     tip_input("Turno Noche", f"tip_n_{i}")
+            if modes[i]:
+                day_sum = int(st.session_state.get(f"tip_u_{i}", 0))
+            else:
+                day_sum = int(st.session_state.get(f"tip_d_{i}", 0)) + int(st.session_state.get(f"tip_n_{i}", 0))
+            st.caption(f"Total del día: {money(day_sum)}")
 
     tips = {
         "unico": [int(st.session_state.get(f"tip_u_{i}", 0)) for i in range(7)],
         "dia": [int(st.session_state.get(f"tip_d_{i}", 0)) for i in range(7)],
         "noche": [int(st.session_state.get(f"tip_n_{i}", 0)) for i in range(7)],
     }
-    week_total = sum(tips["unico"]) if single else sum(tips["dia"]) + sum(tips["noche"])
+    week_total = sum(
+        tips["unico"][i] if modes[i] else tips["dia"][i] + tips["noche"][i] for i in range(7)
+    )
     st.markdown(f"Total semana: **{money(week_total)}**")
 
     # ---- Sección 4
     st.subheader("4. Calcular Propinas")
-    st.caption("Reparte 70% a atención, 20% a cocina y 10% a barra, en proporción a las horas de cada persona dentro de su área.")
+    st.caption(
+        "Atención (70%) y barra (10%) se reparten por turno en los días en Modo Turnos, o por el día entero en Pozo Único. "
+        "Cocina (20%) siempre se reparte por día entero, sobre el total recaudado ese día."
+    )
 
     signature = json.dumps(
-        {"f": st.session_state.get("file_sig"), "s": single, "c": str(cutoff), "a": areas, "t": tips},
+        {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips},
         sort_keys=True, ensure_ascii=False,
     )
 
     if st.button("Procesar y Ver Resultados", type="primary"):
         try:
             cut_sec = cutoff.hour * 3600 + cutoff.minute * 60 + cutoff.second
-            st.session_state["result"] = compute(st.session_state.get("marks"), areas, single, cut_sec, tips)
+            st.session_state["result"] = compute(st.session_state.get("marks"), areas, modes, cut_sec, tips)
             st.session_state["result_sig"] = signature
         except ValueError as e:
             st.session_state.pop("result", None)
