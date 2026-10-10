@@ -652,14 +652,22 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
     modes[i] = True  -> el día i (0 = Lunes) está en Modo Pozo Único.
     modes[i] = False -> el día i está en Modo Turnos (Día / Noche según la hora de corte).
 
+    areas = {nombre: [área_lunes, ..., área_domingo]}: cada persona tiene una lista de 7 áreas, una por
+    día de la semana (weekday). Una persona con área mixta puede tener áreas distintas según el día;
+    "Omitir" excluye ese día del reparto.
+
     Reglas de reparto:
       * atención (70%) y barra (10%): por turno en Modo Turnos; por día entero en Pozo Único.
       * cocina (20%): SIEMPRE por día entero, sobre el pozo total del día (Día + Noche o Pozo Único).
     """
-    active = {n: a for n, a in areas.items() if a != "Omitir"}
+    def area_of(name: str, d: date) -> str:
+        """Área de la persona en el día de la semana de la fecha d."""
+        week = areas.get(name)
+        return week[d.weekday()] if week else "Omitir"
+
     if not pairs:
         raise ValueError("No hay tramos completos (entrada y salida) para calcular.")
-    if not active:
+    if all(a == "Omitir" for week in areas.values() for a in week):
         raise ValueError('Todos los trabajadores están en "Omitir". Asigna un área al menos a uno.')
 
     def day_total(wd: int) -> float:
@@ -676,7 +684,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
     # 1) y 2) Cada tramo completo (entrada, salida) se reparte según el modo de su día
     hours = defaultdict(float)  # (fecha, turno, nombre) -> horas
     for name, d, ent, sal in pairs:
-        if name not in active:
+        if area_of(name, d) == "Omitir":
             continue
         if modes[d.weekday()]:
             hours[(d, "Único", name)] += (sal - ent) / 3600
@@ -692,7 +700,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
     area_hours = defaultdict(lambda: {"atencion": 0.0, "barra": 0.0})
     cocina_day = defaultdict(float)  # (fecha, nombre) -> horas del día completo
     for (d, turno, name), h in hours.items():
-        area = active[name]
+        area = area_of(name, d)
         if area == "cocina":
             cocina_day[(d, name)] += h
         else:
@@ -705,7 +713,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
     rows = []
     # 4a) Atención y barra: por turno (o por día entero si el día es Pozo Único)
     for (d, turno, name), h in hours.items():
-        area = active[name]
+        area = area_of(name, d)
         if area == "cocina":
             continue
         total_area = area_hours[(d, turno)][area]
@@ -798,8 +806,22 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 # ============================================================================
 # HERRAMIENTA: INTERFAZ
 # ============================================================================
+def describe_week(week: list) -> str:
+    """Resume la semana agrupando días consecutivos con la misma área."""
+    parts, i = [], 0
+    while i < 7:
+        j = i
+        while j + 1 < 7 and week[j + 1] == week[i]:
+            j += 1
+        parts.append(f"{DAYS[i]}: {week[i]}" if i == j else f"{DAYS[i]} a {DAYS[j]}: {week[i]}")
+        i = j + 1
+    return "; ".join(parts)
+
+
 def reset_tool_state():
     for k in ("file_sig", "attendance", "fixes", "workers_df", "result", "result_sig", "workers_editor", "fix_editor"):
+        st.session_state.pop(k, None)
+    for k in [k for k in st.session_state if str(k).startswith("mixdays_")]:
         st.session_state.pop(k, None)
 
 
@@ -834,7 +856,12 @@ def render_tool(user: dict):
                 st.session_state.update(
                     file_sig=sig,
                     attendance=attendance,
-                    workers_df=pd.DataFrame({"Nombre": names, "Área": ["atencion"] * len(names)}),
+                    workers_df=pd.DataFrame({
+                        "Nombre": names,
+                        "Área Principal": ["atencion"] * len(names),
+                        "Área mixta": [False] * len(names),
+                        "Segunda Área": pd.Series([None] * len(names), dtype=object),
+                    }),
                     file_info=f'{len(marks) + len(empties)} filas leídas de la hoja "{sheet}"'
                     + (f" ({'; '.join(extras)})." if extras else "."),
                 )
@@ -863,10 +890,15 @@ def render_tool(user: dict):
     modes = [bool(st.session_state.get(f"single_{i}", False)) for i in range(7)]
 
     st.markdown("**Trabajadores encontrados**")
-    areas = {}
+    areas = {}          # nombre -> lista de 7 áreas (Lunes a Domingo)
+    mixed_errors = []   # personas con área mixta sin Segunda Área
     if "workers_df" not in st.session_state:
         st.info("Sube un archivo para ver aquí a los trabajadores y asignarles un área.")
     else:
+        st.caption(
+            "Elige el Área Principal de cada persona. Si trabaja en dos áreas según el día, marca Área mixta, "
+            "elige su Segunda Área y luego indica abajo en qué días trabaja en ella."
+        )
         edited = st.data_editor(
             st.session_state["workers_df"],
             key="workers_editor",
@@ -875,10 +907,41 @@ def render_tool(user: dict):
             disabled=["Nombre"],
             column_config={
                 "Nombre": st.column_config.TextColumn("Nombre"),
-                "Área": st.column_config.SelectboxColumn("Área", options=AREAS, required=True),
+                "Área Principal": st.column_config.SelectboxColumn("Área Principal", options=AREAS, required=True),
+                "Área mixta": st.column_config.CheckboxColumn("Área mixta", help="Trabaja en dos áreas según el día de la semana."),
+                "Segunda Área": st.column_config.SelectboxColumn(
+                    "Segunda Área", options=AREAS, required=False, help="Solo se usa si Área mixta está marcada."),
             },
         )
-        areas = dict(zip(edited["Nombre"], edited["Área"]))
+
+        # Streamlit descarta el valor de widgets que dejan de dibujarse (p. ej. al desmarcar Área mixta); lo conservamos.
+        for k in [k for k in st.session_state if str(k).startswith("mixdays_")]:
+            st.session_state[k] = st.session_state[k]
+
+        records = edited.to_dict("records")
+        if any(bool(r["Área mixta"]) for r in records):
+            st.markdown("**Días de la Segunda Área**")
+            st.caption("Selecciona los días en que cada persona trabaja en su Segunda Área. Los demás días cuentan en su Área Principal.")
+
+        for r in records:
+            name, main = r["Nombre"], r["Área Principal"]
+            if not bool(r["Área mixta"]):
+                areas[name] = [main] * 7
+                continue
+            second = r["Segunda Área"]
+            if is_missing(second):
+                mixed_errors.append(name)
+                second = main
+            second_days = st.multiselect(
+                f"{name}: días en Segunda Área ({'sin elegir' if name in mixed_errors else second}); resto: {main}",
+                DAYS,
+                key=f"mixdays_{name}",
+            )
+            areas[name] = [second if DAYS[i] in second_days else main for i in range(7)]
+            st.caption("Semana de " + name + " → " + describe_week(areas[name]))
+
+        if mixed_errors:
+            st.warning("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
 
     # ---- Sección 3
     st.subheader("3. Propinas Recaudadas ($)")
@@ -946,6 +1009,8 @@ def render_tool(user: dict):
                     f"Quedan {len(pending)} registros con marcas faltantes sin resolver. "
                     "Complétalos en la tabla de registros con marcas faltantes (o márcalos como Descartar) y guarda las correcciones."
                 )
+            if mixed_errors:
+                raise ValueError("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
             result = compute(pairs, areas, modes, cut_sec, tips)
             incomplete_keys = [
                 (r["Nombre"], r["Fecha"])
