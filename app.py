@@ -421,9 +421,10 @@ def read_marks(file_bytes: bytes):
 
 
 # ============================================================================
-# HERRAMIENTA: REVISIÓN DE MARCAS FALTANTES
+# HERRAMIENTA: ASISTENCIA CON 4 MARCAS FIJAS POR DÍA Y REVISIÓN DE EXCEPCIONES
 # ============================================================================
-ATT_COLS = ["Nombre", "Fecha", "Tramo", "Entrada", "Salida"]
+SLOTS = ["Entrada 1", "Salida 1", "Entrada 2", "Salida 2"]
+ATT_COLS = ["Nombre", "Fecha"] + SLOTS + ["Marcas originales", "Nota"]
 
 
 def is_missing(v) -> bool:
@@ -441,19 +442,51 @@ def to_date(v):
     return v.date() if isinstance(v, datetime) else v
 
 
-def problem_label(ent, sal) -> str:
-    if is_missing(ent) and is_missing(sal):
-        return "Sin entrada ni salida"
-    return "Falta entrada" if is_missing(ent) else "Falta salida"
+def slot_problems(vals) -> list:
+    """
+    Valida un día con el esquema fijo [Entrada 1, Salida 1, Entrada 2, Salida 2].
+    Es válido tener solo la jornada 1 (Entrada 2 y Salida 2 vacías) o las dos jornadas completas.
+    """
+    e1, s1, e2, s2 = [None if is_missing(v) else int(v) for v in vals]
+    if e1 is None and s1 is None and e2 is None and s2 is None:
+        return ["Sin marcas"]
+    out = []
+    if e1 is None and s1 is None:
+        out.append("Falta la jornada 1 (Entrada 1 y Salida 1)")
+    else:
+        if e1 is None:
+            out.append("Falta Entrada 1")
+        if s1 is None:
+            out.append("Falta Salida 1")
+    if e2 is None and s2 is not None:
+        out.append("Falta Entrada 2")
+    if s2 is None and e2 is not None:
+        out.append("Falta Salida 2")
+    filled = [v for v in (e1, s1, e2, s2) if v is not None]
+    if any(b <= a for a, b in zip(filled, filled[1:])):
+        out.append("Horas fuera de orden (cada marca debe ser posterior a la anterior)")
+    return out
+
+
+def needs_review(rec: dict) -> bool:
+    return bool(slot_problems([rec[c] for c in SLOTS])) or bool(rec.get("Nota"))
+
+
+def problem_text(rec: dict) -> str:
+    parts = slot_problems([rec[c] for c in SLOTS])
+    if rec.get("Nota"):
+        parts.append(rec["Nota"])
+    return "; ".join(parts)
 
 
 def build_attendance(marks, empties) -> pd.DataFrame:
     """
-    DataFrame principal de asistencia: una fila por tramo (entrada, salida) de cada persona y día.
-    Las marcas de cada persona/día se ordenan y se emparejan en secuencia. Una marca que queda sin
-    pareja se toma como Entrada y deja la Salida vacía; las filas del Excel con la hora vacía
-    también generan huecos. El usuario puede corregir cualquiera de las dos columnas.
-    Entrada y Salida se guardan en segundos desde medianoche (o None si faltan).
+    DataFrame principal: UNA fila por trabajador y fecha, con 4 columnas fijas de tiempo
+    (Entrada 1, Salida 1, Entrada 2, Salida 2), en segundos desde medianoche (o None si falta).
+
+    Las marcas del día se ordenan y se asignan en ese orden a las 4 columnas. Si hay menos de 4,
+    las últimas columnas quedan vacías; si hay más de 4, se usan las 4 primeras y se deja una
+    Nota para revisión. 'Marcas originales' conserva todas las horas que traía el archivo.
     """
     valid, blank = defaultdict(set), defaultdict(int)
     for name, d, sec in marks:
@@ -463,75 +496,97 @@ def build_attendance(marks, empties) -> pd.DataFrame:
 
     rows = []
     for (name, d) in sorted(set(valid) | set(blank), key=lambda k: (k[1], k[0].casefold())):
-        slots = sorted(valid.get((name, d), ())) + [None] * blank.get((name, d), 0)
-        for i in range(0, len(slots), 2):
-            rows.append({
-                "Nombre": name, "Fecha": d, "Tramo": i // 2 + 1,
-                "Entrada": slots[i], "Salida": slots[i + 1] if i + 1 < len(slots) else None,
-            })
+        times = sorted(valid.get((name, d), ()))
+        n_blank = blank.get((name, d), 0)
+        slots = (times[:4] + [None] * 4)[:4]
+
+        notes = []
+        if len(times) > 4:
+            notes.append(f"Hay {len(times)} marcas en el archivo; solo se cargaron las 4 primeras")
+        if n_blank:
+            notes.append(f"{n_blank} fila(s) con la hora vacía en el archivo")
+
+        original = ", ".join(hhmm(t) for t in times) if times else "(ninguna)"
+        if n_blank:
+            original += f" (+{n_blank} sin hora)"
+
+        rows.append({
+            "Nombre": name, "Fecha": d,
+            **dict(zip(SLOTS, slots)),
+            "Marcas originales": original,
+            "Nota": "; ".join(notes),
+        })
     return pd.DataFrame(rows, columns=ATT_COLS, dtype=object)
 
 
-def incomplete_mask(df: pd.DataFrame) -> pd.Series:
-    return df["Entrada"].map(is_missing) | df["Salida"].map(is_missing)
+def review_mask(df: pd.DataFrame) -> pd.Series:
+    return pd.Series([needs_review(r) for r in df.to_dict("records")], index=df.index, dtype=bool)
 
 
 def apply_corrections(main: pd.DataFrame, fixes: dict) -> pd.DataFrame:
-    """Integra las correcciones guardadas al DataFrame principal (y quita los tramos descartados)."""
+    """Integra las correcciones guardadas al DataFrame principal (y quita los días descartados)."""
     out = []
     for rec in main.to_dict("records"):
-        if is_missing(rec["Entrada"]) or is_missing(rec["Salida"]):
-            fx = fixes.get((rec["Nombre"], rec["Fecha"], int(rec["Tramo"])))
+        if needs_review(rec):
+            fx = fixes.get((rec["Nombre"], rec["Fecha"]))
             if fx:
                 if fx["drop"]:
                     continue
-                rec = {**rec, "Entrada": fx["ent"], "Salida": fx["sal"]}
+                rec = {**rec, **dict(zip(SLOTS, fx["s"])), "Nota": ""}
         out.append(rec)
     return pd.DataFrame(out, columns=ATT_COLS, dtype=object)
 
 
 def resolve_pairs(final: pd.DataFrame):
-    """Separa los tramos listos para calcular de los que siguen con problemas."""
+    """
+    Convierte cada día en sus intervalos [Entrada 1 -> Salida 1] y [Entrada 2 -> Salida 2].
+    La jornada 2 se omite si sus dos celdas están vacías. Los días con problemas quedan pendientes.
+    """
     pairs, pending = [], []
     for rec in final.to_dict("records"):
-        ent, sal = rec["Entrada"], rec["Salida"]
-        if is_missing(ent) or is_missing(sal) or int(sal) <= int(ent):
+        vals = [rec[c] for c in SLOTS]
+        if slot_problems(vals) or rec.get("Nota"):
             pending.append(rec)
-        else:
-            pairs.append((rec["Nombre"], rec["Fecha"], int(ent), int(sal)))
+            continue
+        e1, s1, e2, s2 = vals
+        pairs.append((rec["Nombre"], rec["Fecha"], int(e1), int(s1)))
+        if not is_missing(e2):
+            pairs.append((rec["Nombre"], rec["Fecha"], int(e2), int(s2)))
     return pairs, pending
 
 
 def render_missing_marks():
-    """Muestra SOLO los registros con marcas faltantes y permite completarlos."""
+    """Muestra SOLO los días con marcas faltantes o por revisar y permite completarlos."""
     att = st.session_state.get("attendance")
     if att is None or att.empty:
         return
 
-    mask = incomplete_mask(att)
-    incomplete = att[mask]
-    if incomplete.empty:
+    flagged = att[review_mask(att)]
+    if flagged.empty:
         st.success("Todas las marcas están completas: no hay registros por corregir.")
         return
 
     st.markdown("**Registros con marcas faltantes**")
     st.caption(
-        f"{len(incomplete)} de {len(att)} registros tienen marcas faltantes "
-        f"({incomplete['Nombre'].nunique()} personas). Los {len(att) - len(incomplete)} completos no se muestran. "
-        "Completa Entrada y Salida, o marca Descartar si el registro no corresponde, y presiona Guardar correcciones. "
-        "Si había una sola marca, aparece como Entrada: si en realidad era la salida, bórrala de Entrada y escríbela en Salida."
+        f"{len(flagged)} de {len(att)} días tienen marcas faltantes o por revisar "
+        f"({flagged['Nombre'].nunique()} personas). Los {len(att) - len(flagged)} días completos no se muestran. "
+        "Cada día admite hasta 4 marcas: Entrada 1, Salida 1, Entrada 2 y Salida 2. "
+        "La columna Marcas originales muestra las horas que venían en el archivo, ya cargadas en las columnas de la derecha. "
+        "Completa lo que falte; si no hubo segunda jornada, deja Entrada 2 y Salida 2 vacías. "
+        "Si una marca quedó en una columna equivocada, muévela. Marca Descartar para ignorar todo ese día."
     )
 
+    recs = flagged.to_dict("records")
     base = pd.DataFrame({
-        "Nombre": incomplete["Nombre"].tolist(),
-        "Fecha": incomplete["Fecha"].tolist(),
-        "Tramo": [int(t) for t in incomplete["Tramo"]],
-        "Problema": [problem_label(e, s) for e, s in zip(incomplete["Entrada"], incomplete["Salida"])],
-        "Entrada": pd.Series([sec_to_time(v) for v in incomplete["Entrada"]], dtype=object),
-        "Salida": pd.Series([sec_to_time(v) for v in incomplete["Salida"]], dtype=object),
-        "Descartar": [False] * len(incomplete),
+        "Nombre": [r["Nombre"] for r in recs],
+        "Fecha": [r["Fecha"] for r in recs],
+        "Marcas originales": [r["Marcas originales"] for r in recs],
+        "Problema": [problem_text(r) for r in recs],
+        **{c: pd.Series([sec_to_time(r[c]) for r in recs], dtype=object) for c in SLOTS},
+        "Descartar": [False] * len(recs),
     })
 
+    time_cfg = {c: st.column_config.TimeColumn(c, format="HH:mm", step=60) for c in SLOTS}
     with st.form("fix_form"):
         edited = st.data_editor(
             base,
@@ -539,22 +594,21 @@ def render_missing_marks():
             hide_index=True,
             num_rows="fixed",
             width="stretch",
-            disabled=["Nombre", "Fecha", "Tramo", "Problema"],
+            disabled=["Nombre", "Fecha", "Marcas originales", "Problema"],
             column_config={
                 "Fecha": st.column_config.DateColumn("Fecha", format="DD-MM-YYYY"),
-                "Tramo": st.column_config.NumberColumn("Tramo", format="%d", help="Número de entrada/salida del día."),
-                "Entrada": st.column_config.TimeColumn("Entrada", format="HH:mm", step=60),
-                "Salida": st.column_config.TimeColumn("Salida", format="HH:mm", step=60),
-                "Descartar": st.column_config.CheckboxColumn("Descartar", help="Ignora este registro en el cálculo."),
+                "Marcas originales": st.column_config.TextColumn("Marcas originales", help="Horas que venían en el archivo."),
+                "Problema": st.column_config.TextColumn("Problema detectado"),
+                **time_cfg,
+                "Descartar": st.column_config.CheckboxColumn("Descartar", help="Ignora todo ese día en el cálculo."),
             },
         )
         saved = st.form_submit_button("Guardar correcciones", type="primary")
 
     if saved:
         st.session_state["fixes"] = {
-            (rec["Nombre"], to_date(rec["Fecha"]), int(rec["Tramo"])): {
-                "ent": parse_time(rec["Entrada"]),
-                "sal": parse_time(rec["Salida"]),
+            (rec["Nombre"], to_date(rec["Fecha"])): {
+                "s": [parse_time(rec[c]) for c in SLOTS],
                 "drop": bool(rec["Descartar"]),
             }
             for rec in edited.to_dict("records")
@@ -567,7 +621,7 @@ def render_missing_marks():
         _, pending = resolve_pairs(apply_corrections(att, fixes))
         if pending:
             st.warning(
-                f"Quedan {len(pending)} registros sin resolver: faltan marcas o la salida no es posterior a la entrada. "
+                f"Quedan {len(pending)} días sin resolver: faltan marcas o están fuera de orden. "
                 "Complétalos o márcalos como Descartar, y vuelve a guardar."
             )
         else:
@@ -756,7 +810,7 @@ def render_tool(user: dict):
 
     # ---- Sección 1
     st.subheader("1. Cargar Tus Horas")
-    st.caption("El archivo debe tener las columnas Nombre, Fecha y Hora, con una fila por cada marca de entrada o salida.")
+    st.caption("El archivo debe tener las columnas Nombre, Fecha y Hora, con una fila por cada marca. Cada persona puede tener hasta 4 marcas por día (Entrada 1, Salida 1, Entrada 2, Salida 2).")
     uploaded = st.file_uploader("Archivo Excel", type=["xlsx", "xls"], key="uploader")
 
     if uploaded is None:
@@ -874,7 +928,7 @@ def render_tool(user: dict):
 
     signature = json.dumps(
         {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips,
-         "x": sorted((str(k), v["ent"], v["sal"], v["drop"]) for k, v in (st.session_state.get("fixes") or {}).items())},
+         "x": sorted((str(k), v["s"], v["drop"]) for k, v in (st.session_state.get("fixes") or {}).items())},
         sort_keys=True, ensure_ascii=False,
     )
 
@@ -894,13 +948,13 @@ def render_tool(user: dict):
                 )
             result = compute(pairs, areas, modes, cut_sec, tips)
             incomplete_keys = [
-                (r["Nombre"], r["Fecha"], int(r["Tramo"]))
-                for r in attendance[incomplete_mask(attendance)].to_dict("records")
+                (r["Nombre"], r["Fecha"])
+                for r in attendance[review_mask(attendance)].to_dict("records")
             ]
             n_drop = sum(1 for k in incomplete_keys if fixes.get(k, {}).get("drop"))
             n_fix = sum(1 for k in incomplete_keys if k in fixes and not fixes[k]["drop"])
             if n_fix or n_drop:
-                result["warnings"].insert(0, f"Se integraron {n_fix} registros corregidos a mano y se descartaron {n_drop}.")
+                result["warnings"].insert(0, f"Se integraron {n_fix} días corregidos a mano y se descartaron {n_drop}.")
             st.session_state["result"] = result
             st.session_state["result_sig"] = signature
         except ValueError as e:
