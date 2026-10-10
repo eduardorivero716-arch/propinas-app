@@ -395,7 +395,7 @@ def read_marks(file_bytes: bytes):
                 continue
             i_n, i_f = cells.index("nombre"), cells.index("fecha")
             i_h = cells.index("hora") if "hora" in cells else None
-            marks, skipped = [], 0
+            marks, empties, skipped = [], [], 0
             for i in range(r + 1, len(raw)):
                 row = raw.iloc[i].tolist()
                 name_v = row[i_n]
@@ -407,13 +407,171 @@ def read_marks(file_bytes: bytes):
                 d = parse_date(row[i_f])
                 sec = parse_time(row[i_h]) if i_h is not None else None
                 if sec is None and isinstance(row[i_f], (datetime, numbers.Real)):
-                    sec = parse_time(row[i_f])  # fecha y hora en la misma celda
-                if d is None or sec is None:
+                    alt = parse_time(row[i_f])  # fecha y hora en la misma celda (0 = solo fecha)
+                    sec = alt if alt else None
+                if d is None:
                     skipped += 1
                     continue
+                if sec is None:
+                    empties.append((name, d))  # marca con la hora vacía: se corrige en la tabla de excepciones
+                    continue
                 marks.append((name, d, sec))
-            return marks, skipped, sheet
+            return marks, empties, skipped, sheet
     raise ValueError('No encontré las columnas "Nombre", "Fecha" y "Hora" en el archivo.')
+
+
+# ============================================================================
+# HERRAMIENTA: REVISIÓN DE MARCAS FALTANTES
+# ============================================================================
+ATT_COLS = ["Nombre", "Fecha", "Tramo", "Entrada", "Salida"]
+
+
+def is_missing(v) -> bool:
+    return v is None or (not isinstance(v, str) and bool(pd.isna(v)))
+
+
+def sec_to_time(sec):
+    if is_missing(sec):
+        return None
+    sec = int(sec)
+    return dtime(sec // 3600, (sec % 3600) // 60, sec % 60)
+
+
+def to_date(v):
+    return v.date() if isinstance(v, datetime) else v
+
+
+def problem_label(ent, sal) -> str:
+    if is_missing(ent) and is_missing(sal):
+        return "Sin entrada ni salida"
+    return "Falta entrada" if is_missing(ent) else "Falta salida"
+
+
+def build_attendance(marks, empties) -> pd.DataFrame:
+    """
+    DataFrame principal de asistencia: una fila por tramo (entrada, salida) de cada persona y día.
+    Las marcas de cada persona/día se ordenan y se emparejan en secuencia. Una marca que queda sin
+    pareja se toma como Entrada y deja la Salida vacía; las filas del Excel con la hora vacía
+    también generan huecos. El usuario puede corregir cualquiera de las dos columnas.
+    Entrada y Salida se guardan en segundos desde medianoche (o None si faltan).
+    """
+    valid, blank = defaultdict(set), defaultdict(int)
+    for name, d, sec in marks:
+        valid[(name, d)].add(sec)
+    for name, d in empties:
+        blank[(name, d)] += 1
+
+    rows = []
+    for (name, d) in sorted(set(valid) | set(blank), key=lambda k: (k[1], k[0].casefold())):
+        slots = sorted(valid.get((name, d), ())) + [None] * blank.get((name, d), 0)
+        for i in range(0, len(slots), 2):
+            rows.append({
+                "Nombre": name, "Fecha": d, "Tramo": i // 2 + 1,
+                "Entrada": slots[i], "Salida": slots[i + 1] if i + 1 < len(slots) else None,
+            })
+    return pd.DataFrame(rows, columns=ATT_COLS, dtype=object)
+
+
+def incomplete_mask(df: pd.DataFrame) -> pd.Series:
+    return df["Entrada"].map(is_missing) | df["Salida"].map(is_missing)
+
+
+def apply_corrections(main: pd.DataFrame, fixes: dict) -> pd.DataFrame:
+    """Integra las correcciones guardadas al DataFrame principal (y quita los tramos descartados)."""
+    out = []
+    for rec in main.to_dict("records"):
+        if is_missing(rec["Entrada"]) or is_missing(rec["Salida"]):
+            fx = fixes.get((rec["Nombre"], rec["Fecha"], int(rec["Tramo"])))
+            if fx:
+                if fx["drop"]:
+                    continue
+                rec = {**rec, "Entrada": fx["ent"], "Salida": fx["sal"]}
+        out.append(rec)
+    return pd.DataFrame(out, columns=ATT_COLS, dtype=object)
+
+
+def resolve_pairs(final: pd.DataFrame):
+    """Separa los tramos listos para calcular de los que siguen con problemas."""
+    pairs, pending = [], []
+    for rec in final.to_dict("records"):
+        ent, sal = rec["Entrada"], rec["Salida"]
+        if is_missing(ent) or is_missing(sal) or int(sal) <= int(ent):
+            pending.append(rec)
+        else:
+            pairs.append((rec["Nombre"], rec["Fecha"], int(ent), int(sal)))
+    return pairs, pending
+
+
+def render_missing_marks():
+    """Muestra SOLO los registros con marcas faltantes y permite completarlos."""
+    att = st.session_state.get("attendance")
+    if att is None or att.empty:
+        return
+
+    mask = incomplete_mask(att)
+    incomplete = att[mask]
+    if incomplete.empty:
+        st.success("Todas las marcas están completas: no hay registros por corregir.")
+        return
+
+    st.markdown("**Registros con marcas faltantes**")
+    st.caption(
+        f"{len(incomplete)} de {len(att)} registros tienen marcas faltantes "
+        f"({incomplete['Nombre'].nunique()} personas). Los {len(att) - len(incomplete)} completos no se muestran. "
+        "Completa Entrada y Salida, o marca Descartar si el registro no corresponde, y presiona Guardar correcciones. "
+        "Si había una sola marca, aparece como Entrada: si en realidad era la salida, bórrala de Entrada y escríbela en Salida."
+    )
+
+    base = pd.DataFrame({
+        "Nombre": incomplete["Nombre"].tolist(),
+        "Fecha": incomplete["Fecha"].tolist(),
+        "Tramo": [int(t) for t in incomplete["Tramo"]],
+        "Problema": [problem_label(e, s) for e, s in zip(incomplete["Entrada"], incomplete["Salida"])],
+        "Entrada": pd.Series([sec_to_time(v) for v in incomplete["Entrada"]], dtype=object),
+        "Salida": pd.Series([sec_to_time(v) for v in incomplete["Salida"]], dtype=object),
+        "Descartar": [False] * len(incomplete),
+    })
+
+    with st.form("fix_form"):
+        edited = st.data_editor(
+            base,
+            key="fix_editor",
+            hide_index=True,
+            num_rows="fixed",
+            width="stretch",
+            disabled=["Nombre", "Fecha", "Tramo", "Problema"],
+            column_config={
+                "Fecha": st.column_config.DateColumn("Fecha", format="DD-MM-YYYY"),
+                "Tramo": st.column_config.NumberColumn("Tramo", format="%d", help="Número de entrada/salida del día."),
+                "Entrada": st.column_config.TimeColumn("Entrada", format="HH:mm", step=60),
+                "Salida": st.column_config.TimeColumn("Salida", format="HH:mm", step=60),
+                "Descartar": st.column_config.CheckboxColumn("Descartar", help="Ignora este registro en el cálculo."),
+            },
+        )
+        saved = st.form_submit_button("Guardar correcciones", type="primary")
+
+    if saved:
+        st.session_state["fixes"] = {
+            (rec["Nombre"], to_date(rec["Fecha"]), int(rec["Tramo"])): {
+                "ent": parse_time(rec["Entrada"]),
+                "sal": parse_time(rec["Salida"]),
+                "drop": bool(rec["Descartar"]),
+            }
+            for rec in edited.to_dict("records")
+        }
+
+    fixes = st.session_state.get("fixes")
+    if fixes is None:
+        st.info("Aún no guardas correcciones.")
+    else:
+        _, pending = resolve_pairs(apply_corrections(att, fixes))
+        if pending:
+            st.warning(
+                f"Quedan {len(pending)} registros sin resolver: faltan marcas o la salida no es posterior a la entrada. "
+                "Complétalos o márcalos como Descartar, y vuelve a guardar."
+            )
+        else:
+            st.success("Todos los registros fueron resueltos y se integraron a los datos. Ya puedes calcular.")
 
 
 # ============================================================================
@@ -435,7 +593,7 @@ def hhmm(sec: int) -> str:
     return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}"
 
 
-def compute(marks, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
+def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
     """
     modes[i] = True  -> el día i (0 = Lunes) está en Modo Pozo Único.
     modes[i] = False -> el día i está en Modo Turnos (Día / Noche según la hora de corte).
@@ -445,8 +603,8 @@ def compute(marks, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
       * cocina (20%): SIEMPRE por día entero, sobre el pozo total del día (Día + Noche o Pozo Único).
     """
     active = {n: a for n, a in areas.items() if a != "Omitir"}
-    if not marks:
-        raise ValueError("Primero sube el archivo Excel con las horas.")
+    if not pairs:
+        raise ValueError("No hay tramos completos (entrada y salida) para calcular.")
     if not active:
         raise ValueError('Todos los trabajadores están en "Omitir". Asigna un área al menos a uno.')
 
@@ -461,30 +619,20 @@ def compute(marks, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
 
     warnings = []
 
-    # 1) Marcas por persona y fecha
-    by_pd = defaultdict(set)
-    for name, d, sec in marks:
-        if name in active:
-            by_pd[(name, d)].add(sec)
-
-    # 2) Emparejar marcas (entrada, salida) y repartir el tiempo según el modo de cada día
+    # 1) y 2) Cada tramo completo (entrada, salida) se reparte según el modo de su día
     hours = defaultdict(float)  # (fecha, turno, nombre) -> horas
-    for (name, d), times in sorted(by_pd.items(), key=lambda kv: (kv[0][1], kv[0][0])):
-        single_day = modes[d.weekday()]
-        t = sorted(times)
-        for i in range(0, len(t) - 1, 2):
-            a, b = t[i], t[i + 1]
-            if single_day:
-                hours[(d, "Único", name)] += (b - a) / 3600
-            else:
-                if min(b, cut_sec) - a > 0:
-                    hours[(d, "Día", name)] += (min(b, cut_sec) - a) / 3600
-                if b - max(a, cut_sec) > 0:
-                    hours[(d, "Noche", name)] += (b - max(a, cut_sec)) / 3600
-        if len(t) % 2:
-            warnings.append(f"{name}: marca sin pareja el {fmt_date(d)} a las {hhmm(t[-1])}. Se ignoró.")
+    for name, d, ent, sal in pairs:
+        if name not in active:
+            continue
+        if modes[d.weekday()]:
+            hours[(d, "Único", name)] += (sal - ent) / 3600
+        else:
+            if min(sal, cut_sec) - ent > 0:
+                hours[(d, "Día", name)] += (min(sal, cut_sec) - ent) / 3600
+            if sal - max(ent, cut_sec) > 0:
+                hours[(d, "Noche", name)] += (sal - max(ent, cut_sec)) / 3600
     if not hours:
-        raise ValueError("No se pudieron calcular horas. Revisa que cada persona tenga entrada y salida por día.")
+        raise ValueError("No se pudieron calcular horas. Revisa que haya tramos completos de personas con un área asignada.")
 
     # 3) Horas por (fecha, turno, área) para atención y barra; horas por día para cocina
     area_hours = defaultdict(lambda: {"atencion": 0.0, "barra": 0.0})
@@ -597,7 +745,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 # HERRAMIENTA: INTERFAZ
 # ============================================================================
 def reset_tool_state():
-    for k in ("file_sig", "marks", "workers_df", "result", "result_sig", "workers_editor"):
+    for k in ("file_sig", "attendance", "fixes", "workers_df", "result", "result_sig", "workers_editor", "fix_editor"):
         st.session_state.pop(k, None)
 
 
@@ -619,21 +767,28 @@ def render_tool(user: dict):
         if st.session_state.get("file_sig") != sig:
             reset_tool_state()
             try:
-                marks, skipped, sheet = read_marks(uploaded.getvalue())
-                if not marks:
+                marks, empties, skipped, sheet = read_marks(uploaded.getvalue())
+                if not marks and not empties:
                     raise ValueError("El archivo no tiene marcas válidas (revisa los formatos de Fecha y Hora).")
-                names = sorted({m[0] for m in marks}, key=str.casefold)
+                attendance = build_attendance(marks, empties)
+                names = sorted(attendance["Nombre"].unique(), key=str.casefold)
+                extras = []
+                if empties:
+                    extras.append(f"{len(empties)} con la hora vacía")
+                if skipped:
+                    extras.append(f"{skipped} ignoradas por nombre o fecha inválidos")
                 st.session_state.update(
                     file_sig=sig,
-                    marks=marks,
+                    attendance=attendance,
                     workers_df=pd.DataFrame({"Nombre": names, "Área": ["atencion"] * len(names)}),
-                    file_info=f'{len(marks)} marcas leídas de la hoja "{sheet}"'
-                    + (f"; {skipped} filas ignoradas por datos incompletos." if skipped else "."),
+                    file_info=f'{len(marks) + len(empties)} filas leídas de la hoja "{sheet}"'
+                    + (f" ({'; '.join(extras)})." if extras else "."),
                 )
             except Exception as e:  # noqa: BLE001
                 st.error(f"No se pudo leer el archivo: {e}")
-        if "file_info" in st.session_state and "marks" in st.session_state:
+        if "file_info" in st.session_state and "attendance" in st.session_state:
             st.caption(st.session_state["file_info"])
+            render_missing_marks()
 
     # ---- Sección 2
     st.subheader("2. Configuración de Turnos y Mapeo")
@@ -718,14 +873,35 @@ def render_tool(user: dict):
     )
 
     signature = json.dumps(
-        {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips},
+        {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips,
+         "x": sorted((str(k), v["ent"], v["sal"], v["drop"]) for k, v in (st.session_state.get("fixes") or {}).items())},
         sort_keys=True, ensure_ascii=False,
     )
 
     if st.button("Procesar y Ver Resultados", type="primary"):
         try:
             cut_sec = cutoff.hour * 3600 + cutoff.minute * 60 + cutoff.second
-            st.session_state["result"] = compute(st.session_state.get("marks"), areas, modes, cut_sec, tips)
+            attendance = st.session_state.get("attendance")
+            if attendance is None:
+                raise ValueError("Primero sube el archivo Excel con las horas.")
+            fixes = st.session_state.get("fixes") or {}
+            final = apply_corrections(attendance, fixes)  # DataFrame principal + correcciones
+            pairs, pending = resolve_pairs(final)
+            if pending:
+                raise ValueError(
+                    f"Quedan {len(pending)} registros con marcas faltantes sin resolver. "
+                    "Complétalos en la tabla de registros con marcas faltantes (o márcalos como Descartar) y guarda las correcciones."
+                )
+            result = compute(pairs, areas, modes, cut_sec, tips)
+            incomplete_keys = [
+                (r["Nombre"], r["Fecha"], int(r["Tramo"]))
+                for r in attendance[incomplete_mask(attendance)].to_dict("records")
+            ]
+            n_drop = sum(1 for k in incomplete_keys if fixes.get(k, {}).get("drop"))
+            n_fix = sum(1 for k in incomplete_keys if k in fixes and not fixes[k]["drop"])
+            if n_fix or n_drop:
+                result["warnings"].insert(0, f"Se integraron {n_fix} registros corregidos a mano y se descartaron {n_drop}.")
+            st.session_state["result"] = result
             st.session_state["result_sig"] = signature
         except ValueError as e:
             st.session_state.pop("result", None)
