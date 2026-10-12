@@ -22,6 +22,19 @@ requirements.txt
     password_hash = "pbkdf2_sha256$210000$..."   # o: password = "clave-inicial"
     active        = true
 
+Envío de resumen por correo (opcional)
+--------------------------------------
+Sin configuración, el botón del resumen semanal SIMULA el envío (muestra el correo, no lo manda).
+Para enviar de verdad, agrega en Secrets:
+
+    [smtp]
+    host       = "smtp.gmail.com"
+    port       = 587                       # 587 con STARTTLS; usa 465 con use_ssl = true
+    username   = "propinas@tulocal.cl"
+    password   = "clave-de-aplicacion"     # en Gmail, una "contraseña de aplicación"
+    from_email = "propinas@tulocal.cl"     # opcional
+    use_ssl    = false
+
 Cómo se guardan los accesos
 ---------------------------
 * st.secrets es de SOLO LECTURA mientras la app corre. Por eso:
@@ -46,12 +59,16 @@ import numbers
 import os
 import re
 import secrets as pysecrets
+import smtplib
+import ssl
 import threading
 import time
 import unicodedata
 from collections import defaultdict
 from datetime import date, datetime, time as dtime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -81,6 +98,10 @@ TURNO_ORDER = {"Día": 0, "Noche": 1, "Único": 2, "Día completo": 3}
 # atencion = Garzón / Garzona. Cocina no tiene descuento.
 ALFREDO_RATES = {"atencion": 500, "barra": 100}
 ALFREDO_WEEKDAYS = range(0, 6)  # 0 = Lunes ... 5 = Sábado
+
+REPLACEMENT_AREAS = ["atencion", "barra", "cocina"]
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MAX_EMAILS_PER_SESSION = 30
 
 
 # ============================================================================
@@ -652,7 +673,7 @@ def hhmm(sec: int) -> str:
     return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}"
 
 
-def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustments=None) -> dict:
+def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustments=None, extra_hours=None) -> dict:
     """
     modes[i] = True  -> el día i (0 = Lunes) está en Modo Pozo Único.
     modes[i] = False -> el día i está en Modo Turnos (Día / Noche según la hora de corte).
@@ -668,6 +689,9 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustmen
     adjustments = [{"name", "date", "turno", "minutes", "note"}]: ajustes manuales (minutos con signo) que
     se suman o restan a las horas de esa persona en ese día (y turno) ANTES de repartir las propinas.
 
+    extra_hours = [{"name", "date", "turno", "hours"}]: horas de reemplazos / personal sin marcaje (cargadas a
+    mano). Participan en el reparto y en el descuento Alfredo igual que quienes marcan en el reloj.
+
     Descuento Alfredo: por cada día de asistencia de lunes a sábado se descuenta ALFREDO_RATES según el área
     que la persona tuvo ese día (atención 500, barra 100). Se resta del total en el resumen por persona.
     """
@@ -676,7 +700,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustmen
         week = areas.get(name)
         return week[d.weekday()] if week else "Omitir"
 
-    if not pairs and not adjustments:
+    if not pairs and not adjustments and not extra_hours:
         raise ValueError("No hay tramos completos (entrada y salida) para calcular.")
     if all(a == "Omitir" for week in areas.values() for a in week):
         raise ValueError('Todos los trabajadores están en "Omitir". Asigna un área al menos a uno.')
@@ -704,6 +728,14 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustmen
                 hours[(d, "Día", name)] += (min(sal, cut_sec) - ent) / 3600
             if sal - max(ent, cut_sec) > 0:
                 hours[(d, "Noche", name)] += (sal - max(ent, cut_sec)) / 3600
+
+    # 2a) Reemplazos / personal sin marcaje: horas cargadas a mano por día
+    for e in extra_hours or []:
+        d, name = e["date"], e["name"]
+        if area_of(name, d) == "Omitir":
+            continue
+        turno = "Único" if modes[d.weekday()] else (e["turno"] if e["turno"] in ("Día", "Noche") else "Día")
+        hours[(d, turno, name)] += e["hours"]
 
     # 2b) Ajustes manuales: se suman/restan a las horas de la persona ese día antes de repartir
     adj_applied = defaultdict(float)  # nombre -> horas netas ajustadas
@@ -819,6 +851,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustmen
         p["hours"] += r["hours"]
         p["tip"] += r["tip"]
 
+    repl_names = {e["name"] for e in extra_hours or []}
     summary = []
     for name, p in people.items():
         days = sum(len(v) for (n, _a), v in alfredo_dates.items() if n == name)
@@ -829,12 +862,16 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustmen
             "name": name, "area": " / ".join(areas_sorted), "_order": AREA_ORDER.index(areas_sorted[0]),
             "hours": p["hours"], "adj_hours": adj_applied.get(name, 0.0), "tip": tip,
             "alfredo_days": days, "alfredo": alfredo, "total": tip - alfredo,
+            "replacement": name in repl_names,
         })
     summary.sort(key=lambda x: (x["_order"], x["name"].casefold()))
 
+    if repl_names:
+        warnings.insert(0, f"Se incluyeron {len(repl_names)} reemplazo{'s' if len(repl_names) != 1 else ''} sin marcaje: "
+                           + ", ".join(sorted(repl_names, key=str.casefold)) + ".")
     if n_adj:
         net_txt = f"{sum(adj_applied.values()):+.2f}".replace(".", ",")
-        warnings.insert(0, f"Se aplicaron {n_adj} ajustes manuales de horas ({net_txt} h netas).")
+        warnings.insert(0, f"Se aplicaron {n_adj} ajuste{'s' if n_adj != 1 else ''} manual{'es' if n_adj != 1 else ''} de horas ({net_txt} h netas).")
 
     return {
         "summary": summary,
@@ -943,6 +980,118 @@ def to_excel_bytes(df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
 
 
 # ============================================================================
+# ENVÍO DEL RESUMEN SEMANAL POR CORREO
+# ============================================================================
+def get_smtp_config():
+    """Lee [smtp] de st.secrets. Devuelve None si no está configurado (se simula el envío)."""
+    cfg = _secrets_section("smtp")
+    if not cfg:
+        return None
+    cfg = dict(cfg)
+    if not (cfg.get("host") and cfg.get("username") and cfg.get("password")):
+        return None
+    return {
+        "host": str(cfg["host"]),
+        "port": int(cfg.get("port", 587)),
+        "username": str(cfg["username"]),
+        "password": str(cfg["password"]),
+        "from_email": str(cfg.get("from_email") or cfg["username"]),
+        "use_ssl": bool(cfg.get("use_ssl", False)),
+    }
+
+
+def send_email(cfg: dict, to_addr: str, subject: str, body: str) -> None:
+    msg = EmailMessage()
+    msg["From"] = cfg["from_email"]
+    msg["To"] = to_addr
+    msg["Subject"] = " ".join(subject.split())  # sin saltos de línea en el asunto
+    msg.set_content(body)
+    context = ssl.create_default_context()
+    if cfg["use_ssl"]:
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=20, context=context) as server:
+            server.login(cfg["username"], cfg["password"])
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=20) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login(cfg["username"], cfg["password"])
+            server.send_message(msg)
+
+
+def build_email_body(result: dict, srec: dict, wdf: pd.DataFrame, signer: str) -> str:
+    dates = [r["date"] for r in result["rows"]]
+    week = f"{fmt_date(min(dates))} al {fmt_date(max(dates))}"
+    lines = [f"Hola {srec['name']},", "", f"Este es el resumen de tus propinas de la semana del {week}.", "",
+             "Detalle por día:"]
+    for r in wdf.to_dict("records"):
+        lines.append(
+            f"- {r['Día']} | {r['Área']} | {hours_fmt(r['Horas Trabajadas'])} h | "
+            f"Propina {money(r['Propina ($)'])} | Alfredo {money(r['Alfredo'])} | Neto {money(r['Neto del día ($)'])}"
+        )
+    horas = f"- Horas trabajadas: {hours_fmt(srec['hours'])} h"
+    if srec["adj_hours"]:
+        horas += f" (incluye un ajuste manual de {signed_hours(srec['adj_hours'])} h)"
+    lines += [
+        "", "Resumen:", horas,
+        f"- Propina: {money(srec['tip'])}",
+        f"- Alfredo: {money(srec['alfredo'])} ({srec['alfredo_days']} asistencias de lunes a sábado)",
+        f"- Total menos alfredo: {money(srec['total'])}",
+        "", "Saludos,", signer,
+    ]
+    return "\n".join(lines)
+
+
+def render_email_panel(result: dict, srec: dict, wdf: pd.DataFrame):
+    person = srec["name"]
+    auth = st.session_state.get("auth") or {}
+    signer = auth.get("name") if auth.get("role") == "sucursal" else "Administración"
+
+    st.markdown("**Enviar resumen por correo**")
+    to_addr = st.text_input("Correo del colaborador", value=st.session_state.get("emails", {}).get(person, ""),
+                            key=f"mail_to_{person}", placeholder="nombre@correo.cl").strip()
+    subject = st.text_input("Asunto", value=f"Resumen semanal de propinas - {person}", key=f"mail_subject_{person}")
+    default_body = build_email_body(result, srec, wdf, signer)
+    tag = hashlib.md5(default_body.encode("utf-8")).hexdigest()[:8]  # si cambian los datos, se regenera el texto
+    body = st.text_area("Mensaje (editable)", value=default_body, height=320, key=f"mail_body_{person}_{tag}")
+
+    cfg = get_smtp_config()
+    if cfg is None:
+        st.info('El envío real no está configurado (falta la sección [smtp] en Secrets): el botón simula el envío.')
+
+    valid = bool(EMAIL_RE.match(to_addr))
+    b1, b2 = st.columns(2)
+    with b1:
+        send = st.button("Enviar correo" if cfg else "Simular envío", key=f"mail_send_{person}", type="primary")
+    with b2:
+        if valid:
+            url = f"mailto:{quote(to_addr)}?subject={quote(subject)}&body={quote(body)}"
+            if len(url) < 1900:
+                st.link_button("Abrir en mi programa de correo", url)
+            else:
+                st.caption("El mensaje es muy largo para abrirlo en el programa de correo.")
+
+    if send:
+        sent = st.session_state.get("emails_sent", 0)
+        if not valid:
+            st.error("Escribe un correo válido.")
+        elif not subject.strip() or not body.strip():
+            st.error("El asunto y el mensaje no pueden estar vacíos.")
+        elif sent >= MAX_EMAILS_PER_SESSION:
+            st.error(f"Alcanzaste el máximo de {MAX_EMAILS_PER_SESSION} correos por sesión.")
+        elif cfg is None:
+            st.success(f"Simulación: el correo para {to_addr} NO se envió realmente (SMTP no configurado).")
+        else:
+            try:
+                send_email(cfg, to_addr, subject, body)
+                st.session_state["emails_sent"] = sent + 1
+                st.success(f"Correo enviado a {to_addr}.")
+            except (smtplib.SMTPException, OSError, ValueError) as e:
+                st.error(f"No se pudo enviar el correo: {e}")
+
+
+# ============================================================================
 # HERRAMIENTA: INTERFAZ
 # ============================================================================
 def describe_week(week: list) -> str:
@@ -955,6 +1104,114 @@ def describe_week(week: list) -> str:
         parts.append(f"{DAYS[i]}: {week[i]}" if i == j else f"{DAYS[i]} a {DAYS[j]}: {week[i]}")
         i = j + 1
     return "; ".join(parts)
+
+
+def expand_replacements(reps: list) -> list:
+    """Reparte las horas totales de cada reemplazo en partes iguales entre los días que trabajó."""
+    out = []
+    for rp in reps:
+        per_day = rp["hours"] / len(rp["dates"])
+        for d in rp["dates"]:
+            out.append({"name": rp["name"], "date": d, "turno": rp["turno"], "hours": per_day})
+    return out
+
+
+def file_dates(att: pd.DataFrame) -> list:
+    """Fechas del archivo, rellenando los días intermedios sin marcas (máx. 31 días)."""
+    ds = sorted({to_date(x) for x in att["Fecha"]})
+    if not ds:
+        return []
+    last = min(ds[-1], ds[0] + timedelta(days=30))
+    return [ds[0] + timedelta(days=i) for i in range((last - ds[0]).days + 1)]
+
+
+def add_replacement(taken: set):
+    """Callback del botón 'Agregar reemplazo'."""
+    ss = st.session_state
+    name = " ".join(str(ss.get("rep_name") or "").split())
+    area = ss.get("rep_area")
+    days = sorted(ss.get("rep_dates") or [])
+    hours = float(ss.get("rep_hours") or 0.0)
+    mail = (ss.get("rep_email") or "").strip()
+    reps = ss.setdefault("replacements", [])
+
+    def fail(msg):
+        ss["rep_msg"] = ("error", msg)
+
+    if not name:
+        return fail("Escribe el nombre del reemplazo.")
+    if len(name) > 60:
+        return fail("El nombre es demasiado largo (máximo 60 caracteres).")
+    if name.casefold() in taken or any(r["name"].casefold() == name.casefold() for r in reps):
+        return fail("Ya existe un trabajador con ese nombre. Usa otro nombre o el ajuste manual de horas.")
+    if area not in REPLACEMENT_AREAS:
+        return fail("Elige el área del reemplazo.")
+    if not days:
+        return fail("Elige al menos un día trabajado.")
+    if hours <= 0:
+        return fail("Indica las horas totales trabajadas.")
+    if hours > 24 * len(days):
+        return fail(f"No puede trabajar más de 24 h por día (máximo {24 * len(days)} h para {len(days)} día(s)).")
+    if mail and not EMAIL_RE.match(mail):
+        return fail("El correo no es válido.")
+
+    reps.append({"name": name, "area": area, "dates": days, "hours": hours,
+                 "turno": ss.get("rep_turno", "Día"), "email": mail})
+    ss["rep_name"], ss["rep_dates"], ss["rep_hours"], ss["rep_email"] = "", [], 0.0, ""
+    ss["rep_msg"] = ("ok", f"Reemplazo \"{name}\" agregado.")
+
+
+def remove_replacement(i: int):
+    lst = st.session_state.get("replacements", [])
+    if 0 <= i < len(lst):
+        lst.pop(i)
+
+
+def render_replacements(att, taken: set, cutoff):
+    """Registro de reemplazos y personal temporal que no aparece en el reloj de control."""
+    st.caption(
+        "Registra a quienes trabajaron sin marcar en el reloj: indica nombre, área, días trabajados y horas totales. "
+        "Participan en el reparto de propinas y en el descuento Alfredo como cualquier colaborador. "
+        "Las horas totales se dividen en partes iguales entre los días elegidos."
+    )
+    if att is None:
+        st.info("Sube un archivo para registrar reemplazos: los días se eligen entre las fechas del archivo.")
+        return
+
+    msg = st.session_state.pop("rep_msg", None)
+    if msg:
+        (st.success if msg[0] == "ok" else st.error)(msg[1])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.text_input("Nombre del reemplazo", key="rep_name", max_chars=60)
+    with c2:
+        st.selectbox("Área asignada", REPLACEMENT_AREAS, key="rep_area")
+    st.multiselect("Días trabajados", file_dates(att), key="rep_dates",
+                   format_func=lambda d: f"{DAYS[d.weekday()]} {fmt_date(d)}")
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        st.number_input("Horas totales", min_value=0.0, max_value=744.0, step=0.5, value=0.0,
+                        format="%.2f", key="rep_hours")
+    with c4:
+        st.selectbox("Turno", ["Día", "Noche"], key="rep_turno",
+                     help=f"Se usa en los días en Modo Turnos (Día: antes de las {cutoff:%H:%M}; Noche: desde esa hora). "
+                          "En Pozo Único y en cocina se ignora.")
+    with c5:
+        st.text_input("Correo (opcional)", key="rep_email", help="Para enviarle su resumen semanal.")
+    st.button("Agregar reemplazo", on_click=add_replacement, args=(taken,))
+
+    reps = st.session_state.get("replacements", [])
+    if reps:
+        st.markdown("**Reemplazos cargados**")
+        for i, rp in enumerate(reps):
+            col_t, col_b = st.columns([5, 1])
+            days_txt = ", ".join(f"{DAYS[d.weekday()][:3]} {d:%d-%m}" for d in rp["dates"])
+            col_t.markdown(
+                f"{rp['name']}: {rp['area']}, {hours_fmt(rp['hours'])} h en {len(rp['dates'])} día(s) "
+                f"({hours_fmt(rp['hours'] / len(rp['dates']))} h por día): {days_txt}"
+            )
+            col_b.button("Quitar", key=f"rep_del_{i}", on_click=remove_replacement, args=(i,))
 
 
 def fmt_minutes(mins: int) -> str:
@@ -1059,10 +1316,10 @@ def render_adjustments(areas: dict, modes: list, cutoff):
 
 
 def reset_tool_state():
-    for k in ("file_sig", "attendance", "fixes", "adjustments", "workers_df", "result", "result_sig",
+    for k in ("file_sig", "attendance", "fixes", "adjustments", "replacements", "emails", "workers_df", "result", "result_sig",
               "workers_editor", "fix_editor", "person_view"):
         st.session_state.pop(k, None)
-    for k in [k for k in st.session_state if str(k).startswith(("mixdays_", "adj_"))]:
+    for k in [k for k in st.session_state if str(k).startswith(("mixdays_", "adj_", "rep_", "mail_"))]:
         st.session_state.pop(k, None)
 
 
@@ -1102,6 +1359,7 @@ def render_tool(user: dict):
                         "Área Principal": ["atencion"] * len(names),
                         "Área mixta": [False] * len(names),
                         "Segunda Área": pd.Series([None] * len(names), dtype=object),
+                        "Correo": pd.Series([None] * len(names), dtype=object),
                     }),
                     file_info=f'{len(marks) + len(empties)} filas leídas de la hoja "{sheet}"'
                     + (f" ({'; '.join(extras)})." if extras else "."),
@@ -1132,6 +1390,7 @@ def render_tool(user: dict):
 
     st.markdown("**Trabajadores encontrados**")
     areas = {}          # nombre -> lista de 7 áreas (Lunes a Domingo)
+    emails = {}         # nombre -> correo (opcional)
     mixed_errors = []   # personas con área mixta sin Segunda Área
     if "workers_df" not in st.session_state:
         st.info("Sube un archivo para ver aquí a los trabajadores y asignarles un área.")
@@ -1152,6 +1411,7 @@ def render_tool(user: dict):
                 "Área mixta": st.column_config.CheckboxColumn("Área mixta", help="Trabaja en dos áreas según el día de la semana."),
                 "Segunda Área": st.column_config.SelectboxColumn(
                     "Segunda Área", options=AREAS, required=False, help="Solo se usa si Área mixta está marcada."),
+                "Correo": st.column_config.TextColumn("Correo", help="Opcional: para enviarle su resumen semanal."),
             },
         )
 
@@ -1166,6 +1426,9 @@ def render_tool(user: dict):
 
         for r in records:
             name, main = r["Nombre"], r["Área Principal"]
+            mail = r.get("Correo")
+            if not is_missing(mail) and str(mail).strip():
+                emails[name] = str(mail).strip()
             if not bool(r["Área mixta"]):
                 areas[name] = [main] * 7
                 continue
@@ -1183,6 +1446,19 @@ def render_tool(user: dict):
 
         if mixed_errors:
             st.warning("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
+
+    # ---- Reemplazos / personal sin marcaje (opcional)
+    taken = {str(n).casefold() for n in areas}
+    with st.expander("Reemplazos y personal sin marcaje (opcional)",
+                     expanded=bool(st.session_state.get("replacements"))):
+        render_replacements(st.session_state.get("attendance"), taken, cutoff)
+    replacements = list(st.session_state.get("replacements", []))
+    for rp in replacements:
+        areas[rp["name"]] = [rp["area"]] * 7
+        if rp.get("email"):
+            emails[rp["name"]] = rp["email"]
+    extra_hours = expand_replacements(replacements)
+    st.session_state["emails"] = emails
 
     # ---- Ajuste manual de horas (opcional)
     if st.session_state.get("attendance") is not None and areas:
@@ -1240,6 +1516,7 @@ def render_tool(user: dict):
     signature = json.dumps(
         {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips,
          "j": [(a["name"], str(a["date"]), a["turno"], a["minutes"]) for a in adjustments],
+         "r": [(rp["name"], rp["area"], [str(d) for d in rp["dates"]], rp["hours"], rp["turno"]) for rp in replacements],
          "x": sorted((str(k), v["s"], v["drop"]) for k, v in (st.session_state.get("fixes") or {}).items())},
         sort_keys=True, ensure_ascii=False,
     )
@@ -1260,7 +1537,7 @@ def render_tool(user: dict):
                 )
             if mixed_errors:
                 raise ValueError("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
-            result = compute(pairs, areas, modes, cut_sec, tips, adjustments)
+            result = compute(pairs, areas, modes, cut_sec, tips, adjustments, extra_hours)
             incomplete_keys = [
                 (r["Nombre"], r["Fecha"])
                 for r in attendance[review_mask(attendance)].to_dict("records")
@@ -1338,12 +1615,15 @@ def render_results(result: dict, stale: bool):
         extra = f"Área: {srec['area']}. Asistencias de lunes a sábado: {srec['alfredo_days']}."
         if srec["adj_hours"]:
             extra += f" Ajuste manual incluido en las horas: {signed_hours(srec['adj_hours'])} h."
+        if srec.get("replacement"):
+            extra += " Reemplazo sin marcaje (horas cargadas a mano)."
         st.caption(extra)
         wdf = person_week_dataframe(result, person)
         st.dataframe(
             wdf.style.format({"Horas Trabajadas": hours_fmt, "Propina ($)": money, "Alfredo": money, "Neto del día ($)": money}),
             hide_index=True, width="stretch",
         )
+        render_email_panel(result, srec, wdf)
 
     st.markdown(f"**Detalle por día y turno** ({len(view)} filas)")
     styled = view.style.format({"Horas Trabajadas": hours_fmt, "Propina ($)": money})
