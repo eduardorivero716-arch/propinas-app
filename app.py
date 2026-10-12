@@ -1107,12 +1107,12 @@ def describe_week(week: list) -> str:
 
 
 def expand_replacements(reps: list) -> list:
-    """Reparte las horas totales de cada reemplazo en partes iguales entre los días que trabajó."""
+    """Convierte cada reemplazo en filas (nombre, fecha, turno, horas) con las horas exactas de cada día."""
     out = []
     for rp in reps:
-        per_day = rp["hours"] / len(rp["dates"])
-        for d in rp["dates"]:
-            out.append({"name": rp["name"], "date": d, "turno": rp["turno"], "hours": per_day})
+        for d, h in sorted(rp["hours_by_date"].items()):
+            if h > 0:
+                out.append({"name": rp["name"], "date": d, "turno": rp["turno"], "hours": h})
     return out
 
 
@@ -1131,7 +1131,7 @@ def add_replacement(taken: set):
     name = " ".join(str(ss.get("rep_name") or "").split())
     area = ss.get("rep_area")
     days = sorted(ss.get("rep_dates") or [])
-    hours = float(ss.get("rep_hours") or 0.0)
+    hours_by_date = {d: float(ss.get(f"rep_h_{d.isoformat()}") or 0.0) for d in days}
     mail = (ss.get("rep_email") or "").strip()
     reps = ss.setdefault("replacements", [])
 
@@ -1148,16 +1148,20 @@ def add_replacement(taken: set):
         return fail("Elige el área del reemplazo.")
     if not days:
         return fail("Elige al menos un día trabajado.")
-    if hours <= 0:
-        return fail("Indica las horas totales trabajadas.")
-    if hours > 24 * len(days):
-        return fail(f"No puede trabajar más de 24 h por día (máximo {24 * len(days)} h para {len(days)} día(s)).")
+    missing = [d for d, h in hours_by_date.items() if h <= 0]
+    if missing:
+        return fail("Indica las horas trabajadas de cada día. Faltan: "
+                    + ", ".join(f"{DAYS[d.weekday()]} {d:%d-%m}" for d in missing) + ".")
+    if any(h > 24 for h in hours_by_date.values()):
+        return fail("Un día no puede tener más de 24 horas.")
     if mail and not EMAIL_RE.match(mail):
         return fail("El correo no es válido.")
 
-    reps.append({"name": name, "area": area, "dates": days, "hours": hours,
+    reps.append({"name": name, "area": area, "hours_by_date": hours_by_date,
                  "turno": ss.get("rep_turno", "Día"), "email": mail})
-    ss["rep_name"], ss["rep_dates"], ss["rep_hours"], ss["rep_email"] = "", [], 0.0, ""
+    for d in days:
+        ss.pop(f"rep_h_{d.isoformat()}", None)
+    ss["rep_name"], ss["rep_dates"], ss["rep_email"] = "", [], ""
     ss["rep_msg"] = ("ok", f"Reemplazo \"{name}\" agregado.")
 
 
@@ -1172,7 +1176,7 @@ def render_replacements(att, taken: set, cutoff):
     st.caption(
         "Registra a quienes trabajaron sin marcar en el reloj: indica nombre, área, días trabajados y horas totales. "
         "Participan en el reparto de propinas y en el descuento Alfredo como cualquier colaborador. "
-        "Las horas totales se dividen en partes iguales entre los días elegidos."
+        "Al elegir los días aparece un campo para escribir las horas exactas de cada uno."
     )
     if att is None:
         st.info("Sube un archivo para registrar reemplazos: los días se eligen entre las fechas del archivo.")
@@ -1189,15 +1193,25 @@ def render_replacements(att, taken: set, cutoff):
         st.selectbox("Área asignada", REPLACEMENT_AREAS, key="rep_area")
     st.multiselect("Días trabajados", file_dates(att), key="rep_dates",
                    format_func=lambda d: f"{DAYS[d.weekday()]} {fmt_date(d)}")
-    c3, c4, c5 = st.columns(3)
+    selected = sorted(st.session_state.get("rep_dates") or [])
+    if selected:
+        st.markdown("**Horas trabajadas por día**")
+        hour_cols = st.columns(4)
+        for i, d in enumerate(selected):
+            with hour_cols[i % 4]:
+                st.number_input(f"{DAYS[d.weekday()]} {d:%d-%m}", min_value=0.0, max_value=24.0, step=0.25,
+                                value=0.0, format="%.2f", key=f"rep_h_{d.isoformat()}")
+        total = sum(float(st.session_state.get(f"rep_h_{d.isoformat()}") or 0.0) for d in selected)
+        st.caption(f"Total: {hours_fmt(total)} h en {len(selected)} día(s).")
+    else:
+        st.caption("Elige los días trabajados para ingresar las horas de cada uno.")
+
+    c3, c4 = st.columns(2)
     with c3:
-        st.number_input("Horas totales", min_value=0.0, max_value=744.0, step=0.5, value=0.0,
-                        format="%.2f", key="rep_hours")
-    with c4:
         st.selectbox("Turno", ["Día", "Noche"], key="rep_turno",
                      help=f"Se usa en los días en Modo Turnos (Día: antes de las {cutoff:%H:%M}; Noche: desde esa hora). "
                           "En Pozo Único y en cocina se ignora.")
-    with c5:
+    with c4:
         st.text_input("Correo (opcional)", key="rep_email", help="Para enviarle su resumen semanal.")
     st.button("Agregar reemplazo", on_click=add_replacement, args=(taken,))
 
@@ -1206,10 +1220,12 @@ def render_replacements(att, taken: set, cutoff):
         st.markdown("**Reemplazos cargados**")
         for i, rp in enumerate(reps):
             col_t, col_b = st.columns([5, 1])
-            days_txt = ", ".join(f"{DAYS[d.weekday()][:3]} {d:%d-%m}" for d in rp["dates"])
+            days_txt = ", ".join(
+                f"{DAYS[d.weekday()][:3]} {d:%d-%m}: {hours_fmt(h)} h" for d, h in sorted(rp["hours_by_date"].items())
+            )
             col_t.markdown(
-                f"{rp['name']}: {rp['area']}, {hours_fmt(rp['hours'])} h en {len(rp['dates'])} día(s) "
-                f"({hours_fmt(rp['hours'] / len(rp['dates']))} h por día): {days_txt}"
+                f"{rp['name']}: {rp['area']}, {hours_fmt(sum(rp['hours_by_date'].values()))} h en "
+                f"{len(rp['hours_by_date'])} día(s) ({days_txt})"
             )
             col_b.button("Quitar", key=f"rep_del_{i}", on_click=remove_replacement, args=(i,))
 
@@ -1516,7 +1532,8 @@ def render_tool(user: dict):
     signature = json.dumps(
         {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips,
          "j": [(a["name"], str(a["date"]), a["turno"], a["minutes"]) for a in adjustments],
-         "r": [(rp["name"], rp["area"], [str(d) for d in rp["dates"]], rp["hours"], rp["turno"]) for rp in replacements],
+         "r": [(rp["name"], rp["area"], sorted((str(d), h) for d, h in rp["hours_by_date"].items()), rp["turno"])
+               for rp in replacements],
          "x": sorted((str(k), v["s"], v["drop"]) for k, v in (st.session_state.get("fixes") or {}).items())},
         sort_keys=True, ensure_ascii=False,
     )
