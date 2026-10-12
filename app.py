@@ -244,7 +244,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, manual_ad
         return tips["dia"][wd] if turno == "Día" else tips["noche"][wd]
 
     hours = defaultdict(float)
-    days_worked_count = defaultdict(set) # Para contar asistencias reales por colaborador (lunes a sábado para Alfredo)
+    days_worked_count = defaultdict(set)
 
     for name, d, ent, sal in pairs:
         if area_of(name, d) == "Omitir": continue
@@ -255,10 +255,8 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, manual_ad
             if min(sal, cut_sec) - ent > 0: hours[(d, "Día", name)] += (min(sal, cut_sec) - ent) / 3600
             if sal - max(ent, cut_sec) > 0: hours[(d, "Noche", name)] += (sal - max(ent, cut_sec)) / 3600
 
-    # Aplicar ajuste manual de horas por colaborador
     for name, adj_val in manual_adj.items():
         if adj_val != 0.0:
-            # Añadimos el ajuste al primer turno/fecha disponible o creamos registro base si no tiene horas
             found = False
             for k in hours:
                 if k[2] == name:
@@ -266,7 +264,6 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, manual_ad
                     found = True
                     break
             if not found and adj_val > 0:
-                # Si no tiene tramos pero se le agregaron horas manuales, las asignamos al primer lunes o fecha base
                 dummy_date = list(set(d for _, d, _, _ in pairs))[0] if pairs else date.today()
                 hours[(dummy_date, "Único", name)] += adj_val
 
@@ -293,7 +290,6 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, manual_ad
         tip = (h / cocina_total[d]) * pool if cocina_total[d] > 0 else 0.0
         rows.append({"date": d, "turno": "Día completo", "name": name, "area": "cocina", "hours": h, "tip": tip})
 
-    # Agrupar por persona para la tabla resumen estilo Google Sheets
     person_summary = defaultdict(lambda: {"hours": 0.0, "tip": 0.0, "role": "", "days_count": 0})
     for r in rows:
         name = r["name"]
@@ -304,8 +300,6 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, manual_ad
     summary_rows = []
     for name, data in person_summary.items():
         role = data["role"]
-        # Regla de Alfredo: 500 de lunes a sábado si es Garzón/Garzona, 100 si es Barra
-        # Contamos cuántos días de lunes a sábado asistió
         lunes_sabado_asistencias = sum(1 for d in days_worked_count[name] if d.weekday() < 6)
         alfredo_desc = (500 * lunes_sabado_asistencias) if ("Garz" in role or "garz" in role.lower()) else (100 * lunes_sabado_asistencias)
         
@@ -334,15 +328,6 @@ def to_excel_bytes(summary_df: pd.DataFrame, detailed_df: pd.DataFrame) -> bytes
         summary_df.to_excel(writer, index=False, sheet_name="Resumen Propinas")
         detailed_df.to_excel(writer, index=False, sheet_name="Detalle Turnos")
     return out.getvalue()
-
-def describe_week(week: list) -> str:
-    parts, i = [], 0
-    while i < 7:
-        j = i
-        while j + 1 < 7 and week[j + 1] == week[i]: j += 1
-        parts.append(f"{DAYS[i]}: {week[i]}" if i == j else f"{DAYS[i]} a {DAYS[j]}: {week[i]}")
-        i = j + 1
-    return "; ".join(parts)
 
 def reset_tool_state():
     for k in ("file_sig", "attendance", "fixes", "workers_df", "result", "result_sig"):
@@ -406,17 +391,4 @@ def main():
                 areas[name] = [main.lower() if main in AREAS else "atencion"] * 7
             else:
                 second = str(r["Segunda Área"]).lower() if not is_missing(r["Segunda Área"]) else main.lower()
-                second_days = st.multiselect(f"{name}: días en Segunda Área ({second}); resto: {main}", DAYS, key=f"mixdays_{name}")
-                m_val = main.lower() if main in AREAS else "atencion"
-                s_val = second if second in AREAS else m_val
-                areas[name] = [s_val if DAYS[i] in second_days else m_val for i in range(7)]
-
-    st.subheader("3. Buscador y Ajuste Manual de Horas (Opcional)")
-    st.markdown("Suma o resta horas de forma manual para colaboradores que se fueron sin marcar o hicieron turnos extra.")
-    manual_adjustments = {}
-    if "workers_df" in st.session_state:
-        with st.expander("Desplegar panel de ajustes de horas manuales"):
-            for name in st.session_state["workers_df"]["Nombre"]:
-                manual_adjustments[name] = st.number_input(f"Ajuste (hrs) para {name}", value=0.0, step=0.5, format="%.1f", key=f"adj_{name}")
-
-    st.subheader("4. Propinas
+                second_days = st.multiselect(f"{name}: días en Segunda Área ({second}); resto: {main}", DAYS, key=f"
