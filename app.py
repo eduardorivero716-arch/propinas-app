@@ -77,6 +77,11 @@ AREA_PCT = {"atencion": 0.70, "cocina": 0.20, "barra": 0.10}
 AREA_ORDER = ["atencion", "cocina", "barra"]
 TURNO_ORDER = {"Día": 0, "Noche": 1, "Único": 2, "Día completo": 3}
 
+# Descuento "Alfredo": monto por cada día de asistencia de lunes a sábado, según el área de ese día.
+# atencion = Garzón / Garzona. Cocina no tiene descuento.
+ALFREDO_RATES = {"atencion": 500, "barra": 100}
+ALFREDO_WEEKDAYS = range(0, 6)  # 0 = Lunes ... 5 = Sábado
+
 
 # ============================================================================
 # SEGURIDAD: HASH Y VERIFICACIÓN DE CONTRASEÑAS
@@ -647,7 +652,7 @@ def hhmm(sec: int) -> str:
     return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}"
 
 
-def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
+def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustments=None) -> dict:
     """
     modes[i] = True  -> el día i (0 = Lunes) está en Modo Pozo Único.
     modes[i] = False -> el día i está en Modo Turnos (Día / Noche según la hora de corte).
@@ -659,13 +664,19 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
     Reglas de reparto:
       * atención (70%) y barra (10%): por turno en Modo Turnos; por día entero en Pozo Único.
       * cocina (20%): SIEMPRE por día entero, sobre el pozo total del día (Día + Noche o Pozo Único).
+
+    adjustments = [{"name", "date", "turno", "minutes", "note"}]: ajustes manuales (minutos con signo) que
+    se suman o restan a las horas de esa persona en ese día (y turno) ANTES de repartir las propinas.
+
+    Descuento Alfredo: por cada día de asistencia de lunes a sábado se descuenta ALFREDO_RATES según el área
+    que la persona tuvo ese día (atención 500, barra 100). Se resta del total en el resumen por persona.
     """
     def area_of(name: str, d: date) -> str:
         """Área de la persona en el día de la semana de la fecha d."""
         week = areas.get(name)
         return week[d.weekday()] if week else "Omitir"
 
-    if not pairs:
+    if not pairs and not adjustments:
         raise ValueError("No hay tramos completos (entrada y salida) para calcular.")
     if all(a == "Omitir" for week in areas.values() for a in week):
         raise ValueError('Todos los trabajadores están en "Omitir". Asigna un área al menos a uno.')
@@ -693,7 +704,32 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
                 hours[(d, "Día", name)] += (min(sal, cut_sec) - ent) / 3600
             if sal - max(ent, cut_sec) > 0:
                 hours[(d, "Noche", name)] += (sal - max(ent, cut_sec)) / 3600
-    if not hours:
+
+    # 2b) Ajustes manuales: se suman/restan a las horas de la persona ese día antes de repartir
+    adj_applied = defaultdict(float)  # nombre -> horas netas ajustadas
+    cocina_adj = defaultdict(float)   # (fecha, nombre) -> horas (cocina se calcula por día entero)
+    n_adj = 0
+    for adj in adjustments or []:
+        name, d, delta = adj["name"], adj["date"], adj["minutes"] / 60
+        area = area_of(name, d)
+        label = f"{name} ({DAYS[d.weekday()]} {fmt_date(d)})"
+        if area == "Omitir":
+            warnings.append(f"Ajuste ignorado: {label} no tiene un área asignada ese día.")
+            continue
+        n_adj += 1
+        adj_applied[name] += delta
+        if area == "cocina":
+            cocina_adj[(d, name)] += delta
+            continue
+        turno = "Único" if modes[d.weekday()] else (adj["turno"] if adj["turno"] in ("Día", "Noche") else "Día")
+        new = hours.get((d, turno, name), 0.0) + delta
+        if new > 1e-9:
+            hours[(d, turno, name)] = new
+        else:
+            hours.pop((d, turno, name), None)
+            if new < -1e-9:
+                warnings.append(f"Ajuste de {label}: restaba más horas de las trabajadas en ese turno; quedó en 0.")
+    if not hours and not cocina_adj:
         raise ValueError("No se pudieron calcular horas. Revisa que haya tramos completos de personas con un área asignada.")
 
     # 3) Horas por (fecha, turno, área) para atención y barra; horas por día para cocina
@@ -705,6 +741,14 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
             cocina_day[(d, name)] += h
         else:
             area_hours[(d, turno)][area] += h
+    for key, delta in cocina_adj.items():  # ajustes de cocina, sobre el total del día
+        new = cocina_day.get(key, 0.0) + delta
+        if new > 1e-9:
+            cocina_day[key] = new
+        else:
+            cocina_day.pop(key, None)
+            if new < -1e-9:
+                warnings.append(f"Ajuste de {key[1]} ({DAYS[key[0].weekday()]} {fmt_date(key[0])}): restaba más horas de las trabajadas; quedó en 0.")
     cocina_total = defaultdict(float)  # fecha -> horas totales de cocina
     for (d, _name), h in cocina_day.items():
         cocina_total[d] += h
@@ -728,7 +772,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
 
     # 5) Avisos por dinero sin repartir
     unassigned = 0.0
-    dates_present = sorted({d for (d, _t, _n) in hours})
+    dates_present = sorted({d for (d, _t, _n) in hours} | {d for (d, _n) in cocina_day})
     for d in dates_present:
         wd = d.weekday()
         label = f"{DAYS[wd]} {fmt_date(d)}"
@@ -762,7 +806,39 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict) -> dict:
                 "carga una sola semana para evitar duplicar propinas."
             )
 
+    # 6) Descuento Alfredo (asistencias de lunes a sábado) y resumen por colaborador
+    alfredo_dates = defaultdict(set)  # (nombre, área) -> fechas con asistencia
+    for r in rows:
+        if r["area"] in ALFREDO_RATES and r["date"].weekday() in ALFREDO_WEEKDAYS:
+            alfredo_dates[(r["name"], r["area"])].add(r["date"])
+
+    people = {}
+    for r in rows:
+        p = people.setdefault(r["name"], {"areas": set(), "hours": 0.0, "tip": 0.0})
+        p["areas"].add(r["area"])
+        p["hours"] += r["hours"]
+        p["tip"] += r["tip"]
+
+    summary = []
+    for name, p in people.items():
+        days = sum(len(v) for (n, _a), v in alfredo_dates.items() if n == name)
+        alfredo = sum(ALFREDO_RATES[a] * len(v) for (n, a), v in alfredo_dates.items() if n == name)
+        tip = int(round(p["tip"]))
+        areas_sorted = sorted(p["areas"], key=AREA_ORDER.index)
+        summary.append({
+            "name": name, "area": " / ".join(areas_sorted), "_order": AREA_ORDER.index(areas_sorted[0]),
+            "hours": p["hours"], "adj_hours": adj_applied.get(name, 0.0), "tip": tip,
+            "alfredo_days": days, "alfredo": alfredo, "total": tip - alfredo,
+        })
+    summary.sort(key=lambda x: (x["_order"], x["name"].casefold()))
+
+    if n_adj:
+        net_txt = f"{sum(adj_applied.values()):+.2f}".replace(".", ",")
+        warnings.insert(0, f"Se aplicaron {n_adj} ajustes manuales de horas ({net_txt} h netas).")
+
     return {
+        "summary": summary,
+        "alfredo_total": sum(x["alfredo"] for x in summary),
         "rows": rows,
         "warnings": warnings,
         "unassigned": unassigned,
@@ -789,17 +865,80 @@ def results_dataframe(result: dict) -> pd.DataFrame:
     )
 
 
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
+SUMMARY_COLS = ["Nombre", "Área", "Horas Trabajadas", "Ajuste manual (h)", "Propina ($)",
+                "Asistencias (L-S)", "Alfredo", "Total menos alfredo"]
+
+
+def summary_dataframe(result: dict) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Nombre": s["name"],
+                "Área": s["area"],
+                "Horas Trabajadas": round(s["hours"], 2),
+                "Ajuste manual (h)": round(s["adj_hours"], 2),
+                "Propina ($)": s["tip"],
+                "Asistencias (L-S)": s["alfredo_days"],
+                "Alfredo": s["alfredo"],
+                "Total menos alfredo": s["total"],
+            }
+            for s in result["summary"]
+        ],
+        columns=SUMMARY_COLS,
+    )
+
+
+WEEK_COLS = ["Día", "Área", "Horas Trabajadas", "Propina ($)", "Alfredo", "Neto del día ($)"]
+
+
+def person_week_dataframe(result: dict, name: str) -> pd.DataFrame:
+    """Detalle día por día de un colaborador: área, horas, propina y descuento Alfredo de cada fecha."""
+    by_date = {}
+    for r in result["rows"]:
+        if r["name"] != name:
+            continue
+        b = by_date.setdefault(r["date"], {"area": r["area"], "hours": 0.0, "tip": 0.0})
+        b["hours"] += r["hours"]
+        b["tip"] += r["tip"]
+    out = []
+    for d in sorted(by_date):
+        b = by_date[d]
+        alfredo = ALFREDO_RATES.get(b["area"], 0) if d.weekday() in ALFREDO_WEEKDAYS else 0
+        tip = int(round(b["tip"]))
+        out.append({
+            "Día": f"{DAYS[d.weekday()]} {fmt_date(d)}", "Área": b["area"],
+            "Horas Trabajadas": round(b["hours"], 2), "Propina ($)": tip,
+            "Alfredo": alfredo, "Neto del día ($)": tip - alfredo,
+        })
+    return pd.DataFrame(out, columns=WEEK_COLS)
+
+
+def signed_hours(v) -> str:
+    return "-" if not v else f"{v:+.2f}".replace(".", ",")
+
+
+def to_excel_bytes(df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
     total = pd.DataFrame(
         [{"Área": "Total", "Día": "", "Turno": "", "Nombre": "",
           "Horas Trabajadas": round(df["Horas Trabajadas"].sum(), 2), "Propina ($)": int(df["Propina ($)"].sum())}]
     )
+    s_total = pd.DataFrame(
+        [{"Nombre": "Total", "Área": "",
+          "Horas Trabajadas": round(summary_df["Horas Trabajadas"].sum(), 2),
+          "Ajuste manual (h)": round(summary_df["Ajuste manual (h)"].sum(), 2),
+          "Propina ($)": int(summary_df["Propina ($)"].sum()),
+          "Asistencias (L-S)": int(summary_df["Asistencias (L-S)"].sum()),
+          "Alfredo": int(summary_df["Alfredo"].sum()),
+          "Total menos alfredo": int(summary_df["Total menos alfredo"].sum())}]
+    )
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        pd.concat([summary_df, s_total], ignore_index=True).to_excel(writer, index=False, sheet_name="Resumen")
+        for col, width in zip("ABCDEFGH", [26, 16, 18, 18, 14, 18, 10, 20]):
+            writer.sheets["Resumen"].column_dimensions[col].width = width
         pd.concat([df, total], ignore_index=True).to_excel(writer, index=False, sheet_name="Distribución")
-        ws = writer.sheets["Distribución"]
-        for col, width in zip("ABCDEF", [10, 20, 8, 26, 18, 14]):
-            ws.column_dimensions[col].width = width
+        for col, width in zip("ABCDEF", [10, 20, 14, 26, 18, 14]):
+            writer.sheets["Distribución"].column_dimensions[col].width = width
     return out.getvalue()
 
 
@@ -818,10 +957,112 @@ def describe_week(week: list) -> str:
     return "; ".join(parts)
 
 
+def fmt_minutes(mins: int) -> str:
+    m = abs(int(mins))
+    return f"{'+' if mins > 0 else '-'}{m // 60} h {m % 60:02d} min"
+
+
+def add_adjustment(areas: dict, modes: list):
+    """Callback del botón 'Agregar ajuste' (se ejecuta antes de redibujar la página)."""
+    ss = st.session_state
+    name, d = ss.get("adj_name"), ss.get("adj_date")
+    mins = int(ss.get("adj_h", 0)) * 60 + int(ss.get("adj_m", 0))
+    if not name or d is None:
+        ss["adj_msg"] = ("error", "Elige un colaborador y una fecha.")
+        return
+    if mins == 0:
+        ss["adj_msg"] = ("error", "Indica las horas o los minutos a ajustar.")
+        return
+    wd = d.weekday()
+    area = areas.get(name, ["Omitir"] * 7)[wd]
+    if area == "Omitir":
+        ss["adj_msg"] = ("error", f"{name} no tiene un área asignada el {DAYS[wd].lower()} (está en Omitir).")
+        return
+    if modes[wd]:
+        turno = "Único"
+    elif area == "cocina":
+        turno = "Día completo"
+    else:
+        turno = ss.get("adj_turno", "Día")
+    if ss.get("adj_sign") == "Restar":
+        mins = -mins
+    ss.setdefault("adjustments", []).append(
+        {"name": name, "date": d, "turno": turno, "minutes": mins, "note": (ss.get("adj_note") or "").strip()}
+    )
+    ss["adj_h"], ss["adj_m"], ss["adj_note"] = 0, 0, ""
+    ss["adj_msg"] = ("ok", "Ajuste agregado.")
+
+
+def remove_adjustment(i: int):
+    lst = st.session_state.get("adjustments", [])
+    if 0 <= i < len(lst):
+        lst.pop(i)
+
+
+def render_adjustments(areas: dict, modes: list, cutoff):
+    """Buscador rápido por colaborador para sumar o restar horas/minutos en un día concreto."""
+    att = st.session_state["attendance"]
+    names = sorted(areas, key=str.casefold)
+    dates = sorted({to_date(x) for x in att["Fecha"]})
+    st.caption(
+        "Suma o resta tiempo a un colaborador en un día concreto: por ejemplo, alguien que se fue sin marcar "
+        "o que se quedó después de su marca. El ajuste se suma a sus horas antes de repartir las propinas."
+    )
+
+    msg = st.session_state.pop("adj_msg", None)
+    if msg:
+        (st.success if msg[0] == "ok" else st.error)(msg[1])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.selectbox("Colaborador (escribe para buscar)", names, index=None,
+                     placeholder="Buscar colaborador…", key="adj_name")
+    with c2:
+        st.selectbox("Fecha", dates, format_func=lambda d: f"{DAYS[d.weekday()]} {fmt_date(d)}", key="adj_date")
+
+    name, d = st.session_state.get("adj_name"), st.session_state.get("adj_date")
+    if name and d is not None:
+        wd = d.weekday()
+        area = areas.get(name, ["Omitir"] * 7)[wd]
+        if area == "Omitir":
+            st.warning(f"{name} está en Omitir el {DAYS[wd].lower()}: no se pueden ajustar sus horas ese día.")
+        elif modes[wd]:
+            st.caption("Ese día está en Pozo Único: el ajuste se suma al día completo.")
+        elif area == "cocina":
+            st.caption("Cocina se calcula por día entero: el ajuste se suma al total del día.")
+        else:
+            st.selectbox("Turno", ["Día", "Noche"], key="adj_turno",
+                         help=f"Día: antes de las {cutoff:%H:%M}. Noche: desde esa hora.")
+
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        st.radio("Operación", ["Sumar", "Restar"], horizontal=True, key="adj_sign")
+    with c4:
+        st.number_input("Horas", min_value=0, max_value=24, step=1, value=0, key="adj_h")
+    with c5:
+        st.number_input("Minutos", min_value=0, max_value=59, step=5, value=0, key="adj_m")
+    st.text_input("Motivo (opcional)", key="adj_note")
+    st.button("Agregar ajuste", on_click=add_adjustment, args=(areas, modes))
+
+    adjs = st.session_state.get("adjustments", [])
+    if adjs:
+        st.markdown("**Ajustes cargados**")
+        for i, a in enumerate(adjs):
+            col_t, col_b = st.columns([5, 1])
+            turno_txt = f", turno {a['turno']}" if a["turno"] in ("Día", "Noche") else ""
+            note_txt = f" ({a['note']})" if a["note"] else ""
+            col_t.markdown(
+                f"{a['name']}: {DAYS[a['date'].weekday()]} {fmt_date(a['date'])}{turno_txt}, "
+                f"**{fmt_minutes(a['minutes'])}**{note_txt}"
+            )
+            col_b.button("Quitar", key=f"adj_del_{i}", on_click=remove_adjustment, args=(i,))
+
+
 def reset_tool_state():
-    for k in ("file_sig", "attendance", "fixes", "workers_df", "result", "result_sig", "workers_editor", "fix_editor"):
+    for k in ("file_sig", "attendance", "fixes", "adjustments", "workers_df", "result", "result_sig",
+              "workers_editor", "fix_editor", "person_view"):
         st.session_state.pop(k, None)
-    for k in [k for k in st.session_state if str(k).startswith("mixdays_")]:
+    for k in [k for k in st.session_state if str(k).startswith(("mixdays_", "adj_"))]:
         st.session_state.pop(k, None)
 
 
@@ -943,6 +1184,13 @@ def render_tool(user: dict):
         if mixed_errors:
             st.warning("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
 
+    # ---- Ajuste manual de horas (opcional)
+    if st.session_state.get("attendance") is not None and areas:
+        with st.expander("Ajuste manual de horas (excepciones y turnos extra)",
+                         expanded=bool(st.session_state.get("adjustments"))):
+            render_adjustments(areas, modes, cutoff)
+    adjustments = list(st.session_state.get("adjustments", []))
+
     # ---- Sección 3
     st.subheader("3. Propinas Recaudadas ($)")
     # Streamlit descarta el valor de widgets que dejan de dibujarse (al cambiar el modo de un día); lo conservamos.
@@ -991,6 +1239,7 @@ def render_tool(user: dict):
 
     signature = json.dumps(
         {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips,
+         "j": [(a["name"], str(a["date"]), a["turno"], a["minutes"]) for a in adjustments],
          "x": sorted((str(k), v["s"], v["drop"]) for k, v in (st.session_state.get("fixes") or {}).items())},
         sort_keys=True, ensure_ascii=False,
     )
@@ -1011,7 +1260,7 @@ def render_tool(user: dict):
                 )
             if mixed_errors:
                 raise ValueError("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
-            result = compute(pairs, areas, modes, cut_sec, tips)
+            result = compute(pairs, areas, modes, cut_sec, tips, adjustments)
             incomplete_keys = [
                 (r["Nombre"], r["Fecha"])
                 for r in attendance[review_mask(attendance)].to_dict("records")
@@ -1049,11 +1298,52 @@ def render_results(result: dict, stale: bool):
         st.caption(f"{money(result['distributed'])} repartidos; {money(result['unassigned'])} quedaron sin repartir.")
 
     df = results_dataframe(result)
+    sdf = summary_dataframe(result)
     query = norm(st.text_input("Buscar por nombre, área, día o turno", key="search"))
-    view = df
+    view, sview = df, sdf
     if query:
-        mask = df.apply(lambda r: query in norm(" ".join(str(v) for v in r.values)), axis=1)
-        view = df[mask]
+        view = df[df.apply(lambda r: query in norm(" ".join(str(v) for v in r.values)), axis=1)]
+        sview = sdf[sdf.apply(lambda r: query in norm(f"{r['Nombre']} {r['Área']}"), axis=1)]
+
+    st.markdown(f"**Resumen por colaborador** ({len(sview)} personas)")
+    st.caption(
+        "Alfredo: se descuentan " + " y ".join(f"{money(v)} en {k}" for k, v in ALFREDO_RATES.items()) +
+        " por cada día de asistencia de lunes a sábado (atencion = garzón/garzona). "
+        "Total menos alfredo = Propina − Alfredo."
+    )
+    s_styled = sview.style.format({
+        "Horas Trabajadas": hours_fmt, "Ajuste manual (h)": signed_hours,
+        "Propina ($)": money, "Alfredo": money, "Total menos alfredo": money,
+    })
+    st.dataframe(s_styled, hide_index=True, width="stretch")
+    st.markdown(
+        f"**Total{' (filas filtradas)' if query else ''}:** propinas {money(sview['Propina ($)'].sum())}, "
+        f"Alfredo {money(sview['Alfredo'].sum())}, total menos alfredo {money(sview['Total menos alfredo'].sum())}"
+    )
+
+    # ---- Resumen semanal individual
+    st.markdown("**Resumen semanal por colaborador**")
+    names = [x["name"] for x in result["summary"]]
+    if st.session_state.get("person_view") not in names:
+        st.session_state.pop("person_view", None)
+    person = st.selectbox("Colaborador (escribe para buscar)", names, index=None,
+                          placeholder="Elige un colaborador para ver su semana…", key="person_view")
+    if person:
+        srec = next(x for x in result["summary"] if x["name"] == person)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Horas trabajadas", hours_fmt(srec["hours"]))
+        m2.metric("Propina ($)", money(srec["tip"]))
+        m3.metric("Alfredo", money(srec["alfredo"]))
+        m4.metric("Total menos alfredo", money(srec["total"]))
+        extra = f"Área: {srec['area']}. Asistencias de lunes a sábado: {srec['alfredo_days']}."
+        if srec["adj_hours"]:
+            extra += f" Ajuste manual incluido en las horas: {signed_hours(srec['adj_hours'])} h."
+        st.caption(extra)
+        wdf = person_week_dataframe(result, person)
+        st.dataframe(
+            wdf.style.format({"Horas Trabajadas": hours_fmt, "Propina ($)": money, "Alfredo": money, "Neto del día ($)": money}),
+            hide_index=True, width="stretch",
+        )
 
     st.markdown(f"**Detalle por día y turno** ({len(view)} filas)")
     styled = view.style.format({"Horas Trabajadas": hours_fmt, "Propina ($)": money})
@@ -1065,7 +1355,7 @@ def render_results(result: dict, stale: bool):
 
     st.download_button(
         "Descargar copia en Excel (.xlsx)",
-        data=to_excel_bytes(df),
+        data=to_excel_bytes(df, sdf),
         file_name="distribucion_propinas.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
