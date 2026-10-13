@@ -21,6 +21,9 @@ requirements.txt
     name          = "Local Centro"
     password_hash = "pbkdf2_sha256$210000$..."   # o: password = "clave-inicial"
     active        = true
+    pct_atencion  = 70                         # opcional: % de reparto de la sucursal (deben sumar 100)
+    pct_barra     = 10
+    pct_cocina    = 20
 
 Envío de resumen por correo (opcional)
 --------------------------------------
@@ -90,7 +93,9 @@ LOGIN_ERROR = "Acceso no autorizado o usuario desactivado"
 
 DAYS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 AREAS = ["atencion", "barra", "cocina", "Omitir"]
-AREA_PCT = {"atencion": 0.70, "cocina": 0.20, "barra": 0.10}
+# Porcentajes iniciales sugeridos (solo valores por defecto de la interfaz). El cálculo usa los configurados.
+DEFAULT_PCTS = {"atencion": 70.0, "barra": 10.0, "cocina": 20.0}
+PCT_AREAS = [("atencion", "Atención / Garzones"), ("barra", "Barra"), ("cocina", "Cocina")]
 AREA_ORDER = ["atencion", "cocina", "barra"]
 TURNO_ORDER = {"Día": 0, "Noche": 1, "Único": 2, "Día completo": 3}
 
@@ -160,6 +165,25 @@ def get_admin():
     }
 
 
+def _valid_pcts(p) -> bool:
+    try:
+        vals = [float(p[a]) for a, _ in PCT_AREAS]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return all(0 <= v <= 100 for v in vals) and round(sum(vals), 6) == 100.0
+
+
+def _pcts_from_cfg(cfg: dict):
+    """Porcentajes definidos en st.secrets: pct_atencion, pct_barra, pct_cocina (opcionales)."""
+    p = {a: cfg.get(f"pct_{a}") for a, _ in PCT_AREAS}
+    return {a: float(v) for a, v in p.items()} if _valid_pcts(p) else None
+
+
+def branch_pcts(rec) -> dict:
+    p = (rec or {}).get("pcts")
+    return {a: float(p[a]) for a, _ in PCT_AREAS} if _valid_pcts(p) else dict(DEFAULT_PCTS)
+
+
 def _secret_users() -> dict:
     users = {}
     section = _secrets_section("users", {}) or {}
@@ -170,6 +194,7 @@ def _secret_users() -> dict:
             "password": cfg.get("password"),
             "password_hash": cfg.get("password_hash"),
             "active": bool(cfg.get("active", True)),
+            "pcts": _pcts_from_cfg(cfg),
         }
     return users
 
@@ -195,7 +220,7 @@ def load_users() -> dict:
     users = _secret_users()
     for uname, ov in _read_overlay().items():
         rec = dict(users.get(uname, {"name": uname, "password": None, "password_hash": None, "active": True}))
-        rec.update({k: v for k, v in ov.items() if k in ("name", "password_hash", "active")})
+        rec.update({k: v for k, v in ov.items() if k in ("name", "password_hash", "active", "pcts")})
         if "password_hash" in ov:
             rec["password"] = None
         users[uname] = rec
@@ -237,6 +262,21 @@ def create_branch(username: str, name: str, password: str) -> str | None:
     return None
 
 
+def get_branch_pcts(username: str) -> dict:
+    return branch_pcts(load_users().get(username))
+
+
+def set_pcts(uname: str, pcts: dict) -> str | None:
+    """Guarda los porcentajes de reparto de una sucursal (deben sumar exactamente 100)."""
+    if not _valid_pcts(pcts):
+        return "Los porcentajes deben estar entre 0 y 100 y sumar exactamente 100%."
+    try:
+        _update_overlay(uname, {"pcts": {a: float(pcts[a]) for a, _ in PCT_AREAS}})
+    except OSError as e:
+        return f"No se pudo guardar: {e}"
+    return None
+
+
 def set_active(uname: str, active: bool) -> str | None:
     try:
         _update_overlay(uname, {"active": bool(active)})
@@ -269,8 +309,10 @@ def build_secrets_toml(users: dict) -> str:
             f'name = "{_toml_str(rec["name"])}"',
             f'password_hash = "{pw_hash}"',
             f'active = {"true" if rec["active"] else "false"}',
-            "",
         ]
+        if rec.get("pcts"):
+            lines += [f"pct_{a} = {float(rec['pcts'][a])}" for a, _ in PCT_AREAS]
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -673,7 +715,8 @@ def hhmm(sec: int) -> str:
     return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}"
 
 
-def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustments=None, extra_hours=None) -> dict:
+def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dict,
+            adjustments=None, extra_hours=None) -> dict:
     """
     modes[i] = True  -> el día i (0 = Lunes) está en Modo Pozo Único.
     modes[i] = False -> el día i está en Modo Turnos (Día / Noche según la hora de corte).
@@ -683,8 +726,11 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustmen
     "Omitir" excluye ese día del reparto.
 
     Reglas de reparto:
-      * atención (70%) y barra (10%): por turno en Modo Turnos; por día entero en Pozo Único.
-      * cocina (20%): SIEMPRE por día entero, sobre el pozo total del día (Día + Noche o Pozo Único).
+      * atención y barra: por turno en Modo Turnos; por día entero en Pozo Único.
+      * cocina: SIEMPRE por día entero, sobre el pozo total del día (Día + Noche o Pozo Único).
+
+    pcts = {"atencion": fracción, "barra": fracción, "cocina": fracción}: porcentaje del pozo que recibe cada
+    área (configurado en la interfaz; deben sumar exactamente 1). Un área en 0 no recibe nada.
 
     adjustments = [{"name", "date", "turno", "minutes", "note"}]: ajustes manuales (minutos con signo) que
     se suman o restan a las horas de esa persona en ese día (y turno) ANTES de repartir las propinas.
@@ -695,6 +741,10 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustmen
     Descuento Alfredo: por cada día de asistencia de lunes a sábado se descuenta ALFREDO_RATES según el área
     que la persona tuvo ese día (atención 500, barra 100). Se resta del total en el resumen por persona.
     """
+    missing_pct = [a for a in AREA_ORDER if a not in pcts]
+    if missing_pct or any(v < 0 for v in pcts.values()) or abs(sum(pcts.values()) - 1) > 1e-9:
+        raise ValueError("Los porcentajes de reparto deben sumar exactamente 100%.")
+
     def area_of(name: str, d: date) -> str:
         """Área de la persona en el día de la semana de la fecha d."""
         week = areas.get(name)
@@ -793,11 +843,11 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustmen
         if area == "cocina":
             continue
         total_area = area_hours[(d, turno)][area]
-        tip = (h / total_area) * (pool_of(d, turno) * AREA_PCT[area]) if total_area > 0 else 0.0
+        tip = (h / total_area) * (pool_of(d, turno) * pcts[area]) if total_area > 0 else 0.0
         rows.append({"date": d, "turno": turno, "name": name, "area": area, "hours": h, "tip": tip})
     # 4b) Cocina: siempre por día entero sobre el pozo total del día
     for (d, name), h in cocina_day.items():
-        pool = day_total(d.weekday()) * AREA_PCT["cocina"]
+        pool = day_total(d.weekday()) * pcts["cocina"]
         tip = (h / cocina_total[d]) * pool if cocina_total[d] > 0 else 0.0
         rows.append({"date": d, "turno": "Día completo", "name": name, "area": "cocina", "hours": h, "tip": tip})
     rows.sort(key=lambda r: (r["date"], TURNO_ORDER[r["turno"]], AREA_ORDER.index(r["area"]), r["name"].casefold()))
@@ -811,12 +861,12 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, adjustmen
         for turno in (["Único"] if modes[wd] else ["Día", "Noche"]):
             pool = pool_of(d, turno)
             for area in ("atencion", "barra"):
-                share = pool * AREA_PCT[area]
+                share = pool * pcts[area]
                 if share > 0 and area_hours[(d, turno)][area] == 0:
                     unassigned += share
                     where = "ese día" if turno == "Único" else f"el turno {turno}"
                     warnings.append(f"{label}: nadie de {area} trabajó {where}, quedan {money(share)} sin repartir.")
-        share = day_total(wd) * AREA_PCT["cocina"]
+        share = day_total(wd) * pcts["cocina"]
         if share > 0 and cocina_total[d] == 0:
             unassigned += share
             warnings.append(f"{label}: nadie de cocina trabajó ese día, quedan {money(share)} sin repartir.")
@@ -1230,6 +1280,64 @@ def render_replacements(att, taken: set, cutoff):
             col_b.button("Quitar", key=f"rep_del_{i}", on_click=remove_replacement, args=(i,))
 
 
+def fmt_pct(v: float) -> str:
+    return f"{v:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
+def save_my_pcts():
+    """Callback: guarda los porcentajes actuales como los de la sucursal que inició sesión."""
+    ss = st.session_state
+    auth = ss.get("auth") or {}
+    vals = {a: float(ss.get(f"pct_{a}") or 0.0) for a, _ in PCT_AREAS}
+    if auth.get("role") != "sucursal":
+        return
+    if round(sum(vals.values()), 6) != 100.0:
+        ss["pct_msg"] = ("error", "Los porcentajes deben sumar exactamente 100% para guardarlos.")
+        return
+    err = set_pcts(auth["username"], vals)
+    ss["pct_msg"] = ("error", err) if err else ("ok", "Porcentajes guardados como los de tu sucursal.")
+
+
+def render_pct_config(user: dict):
+    """Porcentajes de reparto por área. Devuelve (valores en %, suma en %)."""
+    ss = st.session_state
+    if not ss.get("pct_ready"):  # primera vez en la sesión: carga lo guardado para la sucursal
+        saved = get_branch_pcts(user["username"]) if user["role"] == "sucursal" else dict(DEFAULT_PCTS)
+        for a, _ in PCT_AREAS:
+            ss[f"pct_{a}"] = float(saved[a])
+        ss["pct_ready"] = True
+
+    st.markdown("**Porcentajes de reparto por área**")
+    st.caption(
+        "Define qué parte del pozo recibe cada área. Deben sumar exactamente 100%. "
+        "Si tu local no tiene un área, déjala en 0%."
+    )
+    cols = st.columns(3)
+    for col, (a, label) in zip(cols, PCT_AREAS):
+        with col:
+            st.number_input(f"{label} (%)", min_value=0.0, max_value=100.0, step=0.5, format="%.2f", key=f"pct_{a}")
+
+    vals = {a: float(ss.get(f"pct_{a}") or 0.0) for a, _ in PCT_AREAS}
+    total = round(sum(vals.values()), 6)
+    if total == 100.0:
+        st.success("Los porcentajes suman 100%.")
+    else:
+        diff = round(100.0 - total, 6)
+        st.warning(
+            f"Los porcentajes suman {fmt_pct(total)}% ({'faltan' if diff > 0 else 'sobran'} {fmt_pct(abs(diff))} puntos). "
+            "Deben sumar exactamente 100%: el cálculo queda bloqueado hasta corregirlo."
+        )
+
+    if user["role"] == "sucursal":
+        st.button("Guardar como porcentajes de mi sucursal", on_click=save_my_pcts, disabled=(total != 100.0))
+    else:
+        st.caption("Estos porcentajes valen solo para esta sesión. Para fijarlos por sucursal usa el Panel de Control de Acceso.")
+    msg = ss.pop("pct_msg", None)
+    if msg:
+        (st.success if msg[0] == "ok" else st.error)(msg[1])
+    return vals, total
+
+
 def fmt_minutes(mins: int) -> str:
     m = abs(int(mins))
     return f"{'+' if mins > 0 else '-'}{m // 60} h {m % 60:02d} min"
@@ -1404,6 +1512,9 @@ def render_tool(user: dict):
             st.toggle(f"{day}: Pozo Único", value=False, key=f"single_{i}")
     modes = [bool(st.session_state.get(f"single_{i}", False)) for i in range(7)]
 
+    pcts_vals, pcts_total = render_pct_config(user)
+    pcts_ok = pcts_total == 100.0
+
     st.markdown("**Trabajadores encontrados**")
     areas = {}          # nombre -> lista de 7 áreas (Lunes a Domingo)
     emails = {}         # nombre -> correo (opcional)
@@ -1476,6 +1587,15 @@ def render_tool(user: dict):
     extra_hours = expand_replacements(replacements)
     st.session_state["emails"] = emails
 
+    zero_areas = [a for a, _ in PCT_AREAS if pcts_vals[a] == 0]
+    if zero_areas and areas:
+        affected = sorted({n for n, week in areas.items() if any(x in zero_areas for x in week)}, key=str.casefold)
+        if affected:
+            st.warning(
+                f"Hay personas en un área con 0% ({', '.join(zero_areas)}): no recibirán propina por ese tiempo. "
+                "Revisa su área o los porcentajes. Personas: " + ", ".join(affected) + "."
+            )
+
     # ---- Ajuste manual de horas (opcional)
     if st.session_state.get("attendance") is not None and areas:
         with st.expander("Ajuste manual de horas (excepciones y turnos extra)",
@@ -1525,12 +1645,13 @@ def render_tool(user: dict):
     # ---- Sección 4
     st.subheader("4. Calcular Propinas")
     st.caption(
-        "Atención (70%) y barra (10%) se reparten por turno en los días en Modo Turnos, o por el día entero en Pozo Único. "
-        "Cocina (20%) siempre se reparte por día entero, sobre el total recaudado ese día."
+        f"Atención ({fmt_pct(pcts_vals['atencion'])}%) y barra ({fmt_pct(pcts_vals['barra'])}%) se reparten por turno "
+        "en los días en Modo Turnos, o por el día entero en Pozo Único. "
+        f"Cocina ({fmt_pct(pcts_vals['cocina'])}%) siempre se reparte por día entero, sobre el total recaudado ese día."
     )
 
     signature = json.dumps(
-        {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips,
+        {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips, "p": pcts_vals,
          "j": [(a["name"], str(a["date"]), a["turno"], a["minutes"]) for a in adjustments],
          "r": [(rp["name"], rp["area"], sorted((str(d), h) for d, h in rp["hours_by_date"].items()), rp["turno"])
                for rp in replacements],
@@ -1552,9 +1673,14 @@ def render_tool(user: dict):
                     f"Quedan {len(pending)} registros con marcas faltantes sin resolver. "
                     "Complétalos en la tabla de registros con marcas faltantes (o márcalos como Descartar) y guarda las correcciones."
                 )
+            if not pcts_ok:
+                raise ValueError(
+                    f"Los porcentajes de reparto suman {fmt_pct(pcts_total)}%: deben sumar exactamente 100% para calcular."
+                )
             if mixed_errors:
                 raise ValueError("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
-            result = compute(pairs, areas, modes, cut_sec, tips, adjustments, extra_hours)
+            pcts = {a: v / 100 for a, v in pcts_vals.items()}
+            result = compute(pairs, areas, modes, cut_sec, tips, pcts, adjustments, extra_hours)
             incomplete_keys = [
                 (r["Nombre"], r["Fecha"])
                 for r in attendance[review_mask(attendance)].to_dict("records")
@@ -1739,6 +1865,28 @@ def render_admin_panel():
                         else:
                             st.session_state["flash"] = f'Contraseña de "{rec["name"]}" actualizada.'
                             st.rerun()
+
+        # ---- Porcentajes de reparto de la sucursal
+        st.markdown("**Porcentajes de reparto de la sucursal**")
+        cur = branch_pcts(rec)
+        with st.form(f"pct_form_{selected}"):
+            pc = st.columns(3)
+            new_p = {}
+            for col, (area, label) in zip(pc, PCT_AREAS):
+                with col:
+                    new_p[area] = st.number_input(f"{label} (%)", min_value=0.0, max_value=100.0, step=0.5,
+                                                  value=float(cur[area]), format="%.2f", key=f"adm_pct_{selected}_{area}")
+            if st.form_submit_button("Guardar porcentajes"):
+                total = round(sum(new_p.values()), 6)
+                if total != 100.0:
+                    st.error(f"Los porcentajes suman {fmt_pct(total)}%. Deben sumar exactamente 100%.")
+                else:
+                    err = set_pcts(selected, new_p)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state["flash"] = f'Porcentajes de "{rec["name"]}" guardados.'
+                        st.rerun()
 
         # ---- Exportar para secrets
         st.subheader("Hacer los cambios permanentes")
