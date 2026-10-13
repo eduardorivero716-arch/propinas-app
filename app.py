@@ -24,6 +24,8 @@ requirements.txt
     pct_atencion  = 70                         # opcional: % de reparto de la sucursal (deben sumar 100)
     pct_barra     = 10
     pct_cocina    = 20
+    alfredo_atencion = 500                     # opcional: aporte del bachero por asistencia (lunes a sábado)
+    alfredo_barra    = 100
 
 Envío de resumen por correo (opcional)
 --------------------------------------
@@ -101,7 +103,8 @@ TURNO_ORDER = {"Día": 0, "Noche": 1, "Único": 2, "Día completo": 3}
 
 # Descuento "Alfredo": monto por cada día de asistencia de lunes a sábado, según el área de ese día.
 # atencion = Garzón / Garzona. Cocina no tiene descuento.
-ALFREDO_RATES = {"atencion": 500, "barra": 100}
+DEFAULT_ALFREDO = {"atencion": 500, "barra": 100}  # valores iniciales de la interfaz (editables por sucursal)
+ALFREDO_AREAS = [("atencion", "Garzón / Garzona"), ("barra", "Barra")]
 ALFREDO_WEEKDAYS = range(0, 6)  # 0 = Lunes ... 5 = Sábado
 
 REPLACEMENT_AREAS = ["atencion", "barra", "cocina"]
@@ -173,6 +176,25 @@ def _valid_pcts(p) -> bool:
     return all(0 <= v <= 100 for v in vals) and round(sum(vals), 6) == 100.0
 
 
+def _valid_alfredo(r) -> bool:
+    try:
+        vals = [float(r[a]) for a, _ in ALFREDO_AREAS]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return all(0 <= v <= 100000 for v in vals)
+
+
+def _alfredo_from_cfg(cfg: dict):
+    """Montos de Alfredo definidos en st.secrets: alfredo_atencion, alfredo_barra (opcionales)."""
+    r = {a: cfg.get(f"alfredo_{a}") for a, _ in ALFREDO_AREAS}
+    return {a: int(float(v)) for a, v in r.items()} if _valid_alfredo(r) else None
+
+
+def branch_alfredo(rec) -> dict:
+    r = (rec or {}).get("alfredo")
+    return {a: int(float(r[a])) for a, _ in ALFREDO_AREAS} if _valid_alfredo(r) else dict(DEFAULT_ALFREDO)
+
+
 def _pcts_from_cfg(cfg: dict):
     """Porcentajes definidos en st.secrets: pct_atencion, pct_barra, pct_cocina (opcionales)."""
     p = {a: cfg.get(f"pct_{a}") for a, _ in PCT_AREAS}
@@ -195,6 +217,7 @@ def _secret_users() -> dict:
             "password_hash": cfg.get("password_hash"),
             "active": bool(cfg.get("active", True)),
             "pcts": _pcts_from_cfg(cfg),
+            "alfredo": _alfredo_from_cfg(cfg),
         }
     return users
 
@@ -220,7 +243,7 @@ def load_users() -> dict:
     users = _secret_users()
     for uname, ov in _read_overlay().items():
         rec = dict(users.get(uname, {"name": uname, "password": None, "password_hash": None, "active": True}))
-        rec.update({k: v for k, v in ov.items() if k in ("name", "password_hash", "active", "pcts")})
+        rec.update({k: v for k, v in ov.items() if k in ("name", "password_hash", "active", "pcts", "alfredo")})
         if "password_hash" in ov:
             rec["password"] = None
         users[uname] = rec
@@ -277,6 +300,21 @@ def set_pcts(uname: str, pcts: dict) -> str | None:
     return None
 
 
+def get_branch_alfredo(username: str) -> dict:
+    return branch_alfredo(load_users().get(username))
+
+
+def set_alfredo(uname: str, rates: dict) -> str | None:
+    """Guarda los montos de Alfredo de una sucursal (enteros entre 0 y 100.000)."""
+    if not _valid_alfredo(rates):
+        return "Los montos deben ser números entre 0 y 100.000."
+    try:
+        _update_overlay(uname, {"alfredo": {a: int(float(rates[a])) for a, _ in ALFREDO_AREAS}})
+    except OSError as e:
+        return f"No se pudo guardar: {e}"
+    return None
+
+
 def set_active(uname: str, active: bool) -> str | None:
     try:
         _update_overlay(uname, {"active": bool(active)})
@@ -312,6 +350,8 @@ def build_secrets_toml(users: dict) -> str:
         ]
         if rec.get("pcts"):
             lines += [f"pct_{a} = {float(rec['pcts'][a])}" for a, _ in PCT_AREAS]
+        if rec.get("alfredo"):
+            lines += [f"alfredo_{a} = {int(rec['alfredo'][a])}" for a, _ in ALFREDO_AREAS]
         lines.append("")
     return "\n".join(lines)
 
@@ -715,7 +755,7 @@ def hhmm(sec: int) -> str:
     return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}"
 
 
-def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dict,
+def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dict, alfredo_rates: dict,
             adjustments=None, extra_hours=None) -> dict:
     """
     modes[i] = True  -> el día i (0 = Lunes) está en Modo Pozo Único.
@@ -738,12 +778,15 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
     extra_hours = [{"name", "date", "turno", "hours"}]: horas de reemplazos / personal sin marcaje (cargadas a
     mano). Participan en el reparto y en el descuento Alfredo igual que quienes marcan en el reloj.
 
-    Descuento Alfredo: por cada día de asistencia de lunes a sábado se descuenta ALFREDO_RATES según el área
+    Descuento Alfredo: por cada día de asistencia de lunes a sábado se descuenta el monto configurado (alfredo_rates) según el área
     que la persona tuvo ese día (atención 500, barra 100). Se resta del total en el resumen por persona.
     """
     missing_pct = [a for a in AREA_ORDER if a not in pcts]
     if missing_pct or any(v < 0 for v in pcts.values()) or abs(sum(pcts.values()) - 1) > 1e-9:
         raise ValueError("Los porcentajes de reparto deben sumar exactamente 100%.")
+
+    if any(a not in alfredo_rates or alfredo_rates[a] < 0 for a, _ in ALFREDO_AREAS):
+        raise ValueError("Los montos de Alfredo deben ser números mayores o iguales a 0.")
 
     def area_of(name: str, d: date) -> str:
         """Área de la persona en el día de la semana de la fecha d."""
@@ -891,7 +934,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
     # 6) Descuento Alfredo (asistencias de lunes a sábado) y resumen por colaborador
     alfredo_dates = defaultdict(set)  # (nombre, área) -> fechas con asistencia
     for r in rows:
-        if r["area"] in ALFREDO_RATES and r["date"].weekday() in ALFREDO_WEEKDAYS:
+        if r["area"] in alfredo_rates and r["date"].weekday() in ALFREDO_WEEKDAYS:
             alfredo_dates[(r["name"], r["area"])].add(r["date"])
 
     people = {}
@@ -905,7 +948,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
     summary = []
     for name, p in people.items():
         days = sum(len(v) for (n, _a), v in alfredo_dates.items() if n == name)
-        alfredo = sum(ALFREDO_RATES[a] * len(v) for (n, a), v in alfredo_dates.items() if n == name)
+        alfredo = sum(alfredo_rates[a] * len(v) for (n, a), v in alfredo_dates.items() if n == name)
         tip = int(round(p["tip"]))
         areas_sorted = sorted(p["areas"], key=AREA_ORDER.index)
         summary.append({
@@ -924,6 +967,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
         warnings.insert(0, f"Se aplicaron {n_adj} ajuste{'s' if n_adj != 1 else ''} manual{'es' if n_adj != 1 else ''} de horas ({net_txt} h netas).")
 
     return {
+        "alfredo_rates": dict(alfredo_rates),
         "summary": summary,
         "alfredo_total": sum(x["alfredo"] for x in summary),
         "rows": rows,
@@ -990,7 +1034,7 @@ def person_week_dataframe(result: dict, name: str) -> pd.DataFrame:
     out = []
     for d in sorted(by_date):
         b = by_date[d]
-        alfredo = ALFREDO_RATES.get(b["area"], 0) if d.weekday() in ALFREDO_WEEKDAYS else 0
+        alfredo = result["alfredo_rates"].get(b["area"], 0) if d.weekday() in ALFREDO_WEEKDAYS else 0
         tip = int(round(b["tip"]))
         out.append({
             "Día": f"{DAYS[d.weekday()]} {fmt_date(d)}", "Área": b["area"],
@@ -1338,6 +1382,47 @@ def render_pct_config(user: dict):
     return vals, total
 
 
+def save_my_alfredo():
+    """Callback: guarda los montos actuales de Alfredo como los de la sucursal que inició sesión."""
+    ss = st.session_state
+    auth = ss.get("auth") or {}
+    if auth.get("role") != "sucursal":
+        return
+    vals = {a: int(ss.get(f"alf_{a}") or 0) for a, _ in ALFREDO_AREAS}
+    err = set_alfredo(auth["username"], vals)
+    ss["alf_msg"] = ("error", err) if err else ("ok", "Montos guardados como los de tu sucursal.")
+
+
+def render_alfredo_config(user: dict) -> dict:
+    """Aporte del bachero (Alfredo) por día de asistencia. Devuelve {área: monto en $}."""
+    ss = st.session_state
+    if not ss.get("alf_ready"):  # primera vez en la sesión: carga lo guardado para la sucursal
+        saved = get_branch_alfredo(user["username"]) if user["role"] == "sucursal" else dict(DEFAULT_ALFREDO)
+        for a, _ in ALFREDO_AREAS:
+            ss[f"alf_{a}"] = int(saved[a])
+        ss["alf_ready"] = True
+
+    with st.expander("Aporte del bachero (Alfredo)"):
+        st.caption(
+            "Monto que se descuenta a cada persona por cada día que asistió de lunes a sábado, según su área ese día. "
+            "Se multiplica por los días reales asistidos y se resta en la columna Alfredo. "
+            "Cocina no aporta. Puedes subir o bajar los montos."
+        )
+        cols = st.columns(2)
+        for col, (a, label) in zip(cols, ALFREDO_AREAS):
+            with col:
+                st.number_input(f"{label}: aporte por asistencia ($)", min_value=0, max_value=100000,
+                                step=100, key=f"alf_{a}")
+        if user["role"] == "sucursal":
+            st.button("Guardar como montos de mi sucursal", on_click=save_my_alfredo)
+        else:
+            st.caption("Estos montos valen solo para esta sesión. Para fijarlos por sucursal usa el Panel de Control de Acceso.")
+        msg = ss.pop("alf_msg", None)
+        if msg:
+            (st.success if msg[0] == "ok" else st.error)(msg[1])
+    return {a: int(ss.get(f"alf_{a}") or 0) for a, _ in ALFREDO_AREAS}
+
+
 def fmt_minutes(mins: int) -> str:
     m = abs(int(mins))
     return f"{'+' if mins > 0 else '-'}{m // 60} h {m % 60:02d} min"
@@ -1515,6 +1600,8 @@ def render_tool(user: dict):
     pcts_vals, pcts_total = render_pct_config(user)
     pcts_ok = pcts_total == 100.0
 
+    alfredo_vals = render_alfredo_config(user)
+
     st.markdown("**Trabajadores encontrados**")
     areas = {}          # nombre -> lista de 7 áreas (Lunes a Domingo)
     emails = {}         # nombre -> correo (opcional)
@@ -1651,7 +1738,7 @@ def render_tool(user: dict):
     )
 
     signature = json.dumps(
-        {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips, "p": pcts_vals,
+        {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips, "p": pcts_vals, "q": alfredo_vals,
          "j": [(a["name"], str(a["date"]), a["turno"], a["minutes"]) for a in adjustments],
          "r": [(rp["name"], rp["area"], sorted((str(d), h) for d, h in rp["hours_by_date"].items()), rp["turno"])
                for rp in replacements],
@@ -1680,7 +1767,7 @@ def render_tool(user: dict):
             if mixed_errors:
                 raise ValueError("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
             pcts = {a: v / 100 for a, v in pcts_vals.items()}
-            result = compute(pairs, areas, modes, cut_sec, tips, pcts, adjustments, extra_hours)
+            result = compute(pairs, areas, modes, cut_sec, tips, pcts, alfredo_vals, adjustments, extra_hours)
             incomplete_keys = [
                 (r["Nombre"], r["Fecha"])
                 for r in attendance[review_mask(attendance)].to_dict("records")
@@ -1727,7 +1814,8 @@ def render_results(result: dict, stale: bool):
 
     st.markdown(f"**Resumen por colaborador** ({len(sview)} personas)")
     st.caption(
-        "Alfredo: se descuentan " + " y ".join(f"{money(v)} en {k}" for k, v in ALFREDO_RATES.items()) +
+        "Alfredo: se descuentan " + " y ".join(
+            f"{money(result['alfredo_rates'][a])} en {a}" for a, _ in ALFREDO_AREAS) +
         " por cada día de asistencia de lunes a sábado (atencion = garzón/garzona). "
         "Total menos alfredo = Propina − Alfredo."
     )
@@ -1887,6 +1975,24 @@ def render_admin_panel():
                     else:
                         st.session_state["flash"] = f'Porcentajes de "{rec["name"]}" guardados.'
                         st.rerun()
+
+        # ---- Aporte del bachero (Alfredo) de la sucursal
+        st.markdown("**Aporte del bachero (Alfredo) de la sucursal**")
+        cur_alf = branch_alfredo(rec)
+        with st.form(f"alf_form_{selected}"):
+            ac = st.columns(2)
+            new_alf = {}
+            for col, (area, label) in zip(ac, ALFREDO_AREAS):
+                with col:
+                    new_alf[area] = st.number_input(f"{label}: aporte por asistencia ($)", min_value=0, max_value=100000,
+                                                    step=100, value=int(cur_alf[area]), key=f"adm_alf_{selected}_{area}")
+            if st.form_submit_button("Guardar montos"):
+                err = set_alfredo(selected, new_alf)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state["flash"] = f'Montos de Alfredo de "{rec["name"]}" guardados.'
+                    st.rerun()
 
         # ---- Exportar para secrets
         st.subheader("Hacer los cambios permanentes")
