@@ -1,0 +1,17 @@
+/* Estilos generales y limpieza para Streamlit */
+.stApp {
+    background-color: #f8f9fa;
+    font-family: 'Inter', sans-serif;
+}
+
+/* Tarjetas personalizadas estilo Cards */
+div.stMarkdownContainer, .element-container {
+    border-radius: 8px;
+}
+
+/* Botones principales destacados */
+.stButton>button {
+    border-radius: 6px;
+    font-weight: 600;
+    transition: all 0.3s ease;
+}
