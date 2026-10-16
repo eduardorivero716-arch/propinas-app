@@ -1005,6 +1005,7 @@ def render_missing_marks():
         "Descartar": [False] * len(recs),
     })
 
+    status_box = st.container()  # el estado (pendientes) se muestra ARRIBA de la tabla, donde se ve sin desplazarse
     time_cfg = {c: st.column_config.TimeColumn(c, format="HH:mm", step=60) for c in SLOTS}
     with st.form("fix_form"):
         edited = st.data_editor(
@@ -1036,24 +1037,31 @@ def render_missing_marks():
         st.session_state["fixes"] = new_fixes
 
     fixes = st.session_state.get("fixes")
-    if fixes is None:
-        st.info("Aún no guardas correcciones.")
-    else:
-        _, pending = resolve_pairs(apply_corrections(att, fixes))
-        if pending:
-            st.warning(
-                f"Quedan {len(pending)} días sin resolver: faltan marcas o están fuera de orden. "
-                "Complétalos o márcalos como Descartar, y vuelve a guardar."
-            )
-            st.dataframe(
-                pd.DataFrame([
-                    {"Nombre": r["Nombre"], "Fecha": fmt_date(to_date(r["Fecha"])), "Qué falta": problem_text(r)}
-                    for r in pending
-                ]),
-                hide_index=True, width="stretch",
-            )
+    with status_box:
+        if fixes is None:
+            st.info("Aún no guardas correcciones. Completa las horas en la tabla y presiona Guardar correcciones.")
         else:
-            st.success("Todos los registros fueron resueltos y se integraron a los datos. Ya puedes calcular.")
+            _, pending = resolve_pairs(apply_corrections(att, fixes))
+            if pending:
+                st.warning(
+                    f"Quedan {len(pending)} días sin resolver de {len(recs)}. "
+                    "Complétalos en la tabla de abajo (o márcalos como Descartar) y vuelve a guardar. "
+                    "Esta es la lista de lo que falta:"
+                )
+
+                def read_slots(r):
+                    return " | ".join("—" if is_missing(r[c]) else hhmm(int(r[c])) for c in SLOTS)
+
+                st.dataframe(
+                    pd.DataFrame([
+                        {"Nombre": r["Nombre"], "Fecha": fmt_date(to_date(r["Fecha"])),
+                         "Qué falta": problem_text(r), "Lo que el sistema tiene (E1 | S1 | E2 | S2)": read_slots(r)}
+                        for r in pending
+                    ]),
+                    hide_index=True, width="stretch",
+                )
+            else:
+                st.success("Todos los registros fueron resueltos y se integraron a los datos. Ya puedes calcular.")
 
 
 # ============================================================================
