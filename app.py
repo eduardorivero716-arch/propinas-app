@@ -266,6 +266,8 @@ def parse_time(v):
     if not s:
         return None
     m = re.match(r"^(\d{1,2})\s*[:.hH]\s*(\d{2})(?:\s*[:.]\s*(\d{2}))?\s*([aApP]\.?[mM]\.?)?$", s)
+    if not m and re.fullmatch(r"\d{3,4}", s):  # 2330 -> 23:30
+        m = re.match(r"^(\d{1,2})(\d{2})()()$", s)
     if not m:  # texto con fecha y hora (p. ej. 1970-01-01T18:00:00): se toma la hora
         m = re.search(r"[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?", s)
     if not m:
@@ -836,6 +838,14 @@ def hhmm(sec: int) -> str:
     return base + " (+1 día)" if sec >= DAY_SECONDS else base
 
 
+def slot_text(sec) -> str:
+    """Hora como texto HH:MM para la tabla de correcciones ('' si no hay)."""
+    if is_missing(sec):
+        return ""
+    sec = int(sec) % DAY_SECONDS
+    return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}"
+
+
 def normalize_slots(vals: list) -> list:
     """Si una marca es menor o igual a la anterior pero razonable al día siguiente, se entiende que cruzó medianoche."""
     out, prev = [], None
@@ -990,7 +1000,7 @@ def render_missing_marks():
         f"({flagged['Nombre'].nunique()} personas). Los {len(att) - len(flagged)} días completos no se muestran. "
         "Cada día admite hasta 4 marcas: Entrada 1, Salida 1, Entrada 2 y Salida 2. "
         "La columna Marcas originales muestra las horas que venían en el archivo, ya cargadas en las columnas de la derecha. "
-        "Completa lo que falte; si no hubo segunda jornada, deja Entrada 2 y Salida 2 vacías. "
+        "Escribe las horas como HH:MM (ej. 23:30). Completa lo que falte; si no hubo segunda jornada, deja Entrada 2 y Salida 2 vacías. "
         "Si una salida fue después de medianoche, escribe la hora normal (ej. 01:00): se entiende como del día siguiente. "
         "Marca Descartar para ignorar todo ese día."
     )
@@ -1001,12 +1011,19 @@ def render_missing_marks():
         "Fecha": [r["Fecha"] for r in recs],
         "Marcas originales": [r["Marcas originales"] for r in recs],
         "Problema": [problem_text(r) for r in recs],
-        **{c: pd.Series([sec_to_time(r[c]) for r in recs], dtype=object) for c in SLOTS},
+        **{c: pd.Series([slot_text(r[c]) for r in recs], dtype=object) for c in SLOTS},
         "Descartar": [False] * len(recs),
     })
 
     status_box = st.container()  # el estado (pendientes) se muestra ARRIBA de la tabla, donde se ve sin desplazarse
-    time_cfg = {c: st.column_config.TimeColumn(c, format="HH:mm", step=60) for c in SLOTS}
+    # Texto HH:MM (no TimeColumn): una columna de hora totalmente vacía no tiene tipo y Streamlit pierde lo que se escribe.
+    time_cfg = {
+        c: st.column_config.TextColumn(
+            c, max_chars=5, help="Escribe la hora como HH:MM, por ejemplo 23:30. Déjala vacía si no hubo.",
+            validate=r"^(([01]?\d|2[0-3])[:.][0-5]\d)?$",
+        )
+        for c in SLOTS
+    }
     with st.form("fix_form"):
         edited = st.data_editor(
             base,
@@ -1027,17 +1044,28 @@ def render_missing_marks():
 
     if saved:
         # La clave sale de la fila ORIGINAL (misma posición), no de lo que devuelva el editor.
-        new_fixes = {}
+        new_fixes, invalid = {}, []
         for pos, (_idx, row) in enumerate(edited.iterrows()):
             src = recs[pos]
+            parsed = []
+            for c in SLOTS:
+                raw = row[c]
+                val = parse_time(raw)
+                if val is None and not is_missing(raw) and str(raw).strip():
+                    invalid.append(f"{src['Nombre']} ({c}: «{raw}»)")
+                parsed.append(val)
             new_fixes[(src["Nombre"], to_date(src["Fecha"]))] = {
-                "s": normalize_slots([parse_time(row[c]) for c in SLOTS]),
+                "s": normalize_slots(parsed),
                 "drop": bool(row["Descartar"]),
             }
         st.session_state["fixes"] = new_fixes
+        st.session_state["fix_invalid"] = invalid
 
     fixes = st.session_state.get("fixes")
     with status_box:
+        if st.session_state.get("fix_invalid"):
+            st.error("No pude leer estas horas (usa el formato HH:MM, por ejemplo 23:30): "
+                     + "; ".join(st.session_state["fix_invalid"][:10]))
         if fixes is None:
             st.info("Aún no guardas correcciones. Completa las horas en la tabla y presiona Guardar correcciones.")
         else:
