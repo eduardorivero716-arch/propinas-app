@@ -78,8 +78,6 @@ from urllib.parse import quote
 import pandas as pd
 import streamlit as st
 
-from attendance_import import norm, parse_time, read_marks
-
 # ============================================================================
 # CONFIGURACIÓN
 # ============================================================================
@@ -439,6 +437,95 @@ def render_login():
                 st.session_state["lock_until"] = time.time() + LOCKOUT_SECONDS
                 st.session_state["fails"] = 0
             st.error(LOGIN_ERROR)
+
+
+# ============================================================================
+# HERRAMIENTA: LECTURA DEL EXCEL
+# ============================================================================
+def norm(s) -> str:
+    s = "" if s is None or (not isinstance(s, str) and pd.isna(s)) else str(s)
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn").strip().lower()
+
+
+def parse_date(v):
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, numbers.Real) and not isinstance(v, bool):
+        return date(1899, 12, 30) + timedelta(days=int(math.floor(v)))
+    s = str(v).strip()
+    try:
+        m = re.match(r"^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})", s)
+        if m:
+            return date(int(m[1]), int(m[2]), int(m[3]))
+        m = re.match(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})", s)
+        if m:
+            y = int(m[3]) + (2000 if int(m[3]) < 100 else 0)
+            return date(y, int(m[2]), int(m[1]))
+    except ValueError:
+        return None
+    return None
+
+
+def parse_time(v):
+    """Devuelve segundos desde medianoche, o None."""
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return None
+    if isinstance(v, (datetime, dtime)):
+        return v.hour * 3600 + v.minute * 60 + v.second
+    if isinstance(v, numbers.Real) and not isinstance(v, bool):
+        return int(round((v - math.floor(v)) * 86400))
+    m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([apAP])?\.?[mM]?\.?", str(v).strip())
+    if not m:
+        return None
+    h, mi, sec = int(m[1]), int(m[2]), int(m[3] or 0)
+    if m[4]:
+        pm = m[4].lower() == "p"
+        if pm and h < 12:
+            h += 12
+        if not pm and h == 12:
+            h = 0
+    if h > 23 or mi > 59:
+        return None
+    return h * 3600 + mi * 60 + sec
+
+
+def read_marks(file_bytes: bytes):
+    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    for sheet in xls.sheet_names:
+        raw = xls.parse(sheet, header=None, dtype=object)
+        for r in range(min(len(raw), 25)):
+            cells = [norm(c) for c in raw.iloc[r].tolist()]
+            if "nombre" not in cells or "fecha" not in cells:
+                continue
+            i_n, i_f = cells.index("nombre"), cells.index("fecha")
+            i_h = cells.index("hora") if "hora" in cells else None
+            marks, empties, skipped = [], [], 0
+            for i in range(r + 1, len(raw)):
+                row = raw.iloc[i].tolist()
+                name_v = row[i_n]
+                name = " ".join(str(name_v).split()) if not pd.isna(name_v) else ""
+                if not name:
+                    if any(not pd.isna(c) for c in row):
+                        skipped += 1
+                    continue
+                d = parse_date(row[i_f])
+                sec = parse_time(row[i_h]) if i_h is not None else None
+                if sec is None and isinstance(row[i_f], (datetime, numbers.Real)):
+                    alt = parse_time(row[i_f])  # fecha y hora en la misma celda (0 = solo fecha)
+                    sec = alt if alt else None
+                if d is None:
+                    skipped += 1
+                    continue
+                if sec is None:
+                    empties.append((name, d))  # marca con la hora vacía: se corrige en la tabla de excepciones
+                    continue
+                marks.append((name, d, sec))
+            return marks, empties, skipped, sheet
+    raise ValueError('No encontré las columnas "Nombre", "Fecha" y "Hora" en el archivo.')
 
 
 # ============================================================================
