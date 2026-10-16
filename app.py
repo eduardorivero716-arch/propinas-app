@@ -1,25 +1,32 @@
 """
-Filtrado y Cálculo de Propinas  -  con login por sucursal y Panel de Control de Acceso
-======================================================================================
+Filtrado y Cálculo de Propinas - con login por sucursal y Panel de Control de Acceso
+====================================================================================
+Versión autocontenida: TODO está en este archivo (lectura del Excel y estilos incluidos).
+Solo necesitas app.py y requirements.txt en el repositorio.
 
 requirements.txt
 ----------------
-    streamlit>=1.50.0
+    streamlit>=1.50
     pandas>=2.0
     openpyxl>=3.1
     xlrd>=2.0.1        # solo si subes archivos .xls antiguos
+
+.streamlit/config.toml  (recomendado: evita que el modo oscuro del navegador rompa los colores)
+----------------------------------------------------------------------------------------------
+    [theme]
+    base = "light"
 
 .streamlit/secrets.toml  (local)  /  Settings > Secrets  (Streamlit Cloud)
 --------------------------------------------------------------------------
     [admin]
     username = "admin"
     name     = "Administrador"
-    password = "una-clave-larga-y-unica"      # o bien: password_hash = "pbkdf2_sha256$..."
+    password_hash = "pbkdf2_sha256$600000$..."  # recomendado; password en texto plano solo por compatibilidad
 
     # Opcional: sucursales iniciales. También se pueden crear desde el panel.
     [users.centro]
     name          = "Local Centro"
-    password_hash = "pbkdf2_sha256$210000$..."   # o: password = "clave-inicial"
+    password_hash = "pbkdf2_sha256$600000$..."   # o: password = "clave-inicial"
     active        = true
     pct_atencion  = 70                         # opcional: % de reparto de la sucursal (deben sumar 100)
     pct_barra     = 10
@@ -29,38 +36,44 @@ requirements.txt
 
 Envío de resumen por correo (opcional)
 --------------------------------------
-Sin configuración, el botón del resumen semanal SIMULA el envío (muestra el correo, no lo manda).
+Sin configuración, el botón del resumen semanal SIMULA el envío.
 Para enviar de verdad, agrega en Secrets:
 
     [smtp]
     host       = "smtp.gmail.com"
     port       = 587                       # 587 con STARTTLS; usa 465 con use_ssl = true
     username   = "propinas@tulocal.cl"
-    password   = "clave-de-aplicacion"     # en Gmail, una "contraseña de aplicación"
+    password   = "clave-de-aplicacion"
     from_email = "propinas@tulocal.cl"     # opcional
     use_ssl    = false
 
+Con SMTP configurado, solo se puede enviar al correo cargado en la tabla de trabajadores
+(no a direcciones libres) y hay un límite de envíos por hora.
+
 Cómo se guardan los accesos
 ---------------------------
-* st.secrets es de SOLO LECTURA mientras la app corre. Por eso:
-    - El administrador y las sucursales "semilla" viven en st.secrets.
-    - Los cambios hechos desde el panel (crear, activar/desactivar, cambiar clave)
-      se guardan en un archivo JSON (users_db.json) que se superpone a los secrets.
-      Solo guarda hashes PBKDF2, nunca contraseñas en texto plano.
-* En Streamlit Cloud el disco es EFÍMERO: users_db.json se pierde cuando la app se
-  reinicia o se vuelve a desplegar. Para que los cambios sean permanentes, usa en el
-  panel el botón "Generar configuración para st.secrets" y pega el resultado en
-  Settings > Secrets de tu app.
-* La clave del administrador solo se cambia editando st.secrets.
+* st.secrets es de SOLO LECTURA mientras la app corre. El administrador y las sucursales
+  "semilla" viven en st.secrets. Los cambios hechos desde el panel se guardan en users_db.json
+  (solo hashes, nunca contraseñas en texto plano).
+* En Streamlit Cloud el disco es EFÍMERO: users_db.json se pierde al reiniciar o redesplegar.
+  Usa en el panel el botón "Generar configuración para st.secrets" y pega el resultado en
+  Settings > Secrets para hacerlo permanente.
 * No subas users_db.json ni secrets.toml a GitHub (agrégalos a .gitignore).
+
+Turnos que cruzan medianoche
+----------------------------
+Una marca de madrugada (antes de las 05:00) se asigna al día anterior si ese día quedó con una
+marca abierta (cantidad impar). Así, entrar a las 20:00 y salir a las 01:00 cuenta como un solo
+turno del día de entrada.
 """
+from __future__ import annotations
 
 import hashlib
+import html
 import hmac
 import io
 import json
 import math
-import numbers
 import os
 import re
 import secrets as pysecrets
@@ -75,41 +88,265 @@ from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import quote
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
 # ============================================================================
 # CONFIGURACIÓN
 # ============================================================================
-st.set_page_config(page_title="Filtrado y Cálculo de Propinas", page_icon="💵", layout="wide")
+st.set_page_config(
+    page_title="Propinas | Gestión semanal",
+    page_icon="💠",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+APP_CSS = """
+:root {
+  --ink: #17263c;
+  --muted: #5a6a7e;
+  --line: #e2e8f0;
+  --canvas: #f4f7fb;
+  --paper: #ffffff;
+  --navy: #17365d;
+  --navy-2: #244b78;
+  --teal: #167d77;
+  --gold: #d6a84f;
+  --ok-bg: #f2faf8;
+  --ok-line: #c8e4de;
+  --ok-ink: #16665f;
+  --step-ink: #66758a;
+  --radius: 18px;
+  color-scheme: light;
+}
+[data-testid="stAppViewContainer"] { background: var(--canvas); }
+[data-testid="stHeader"] { background: rgba(244,247,251,.90); }
+.block-container { max-width: 1500px; padding-top: 1.7rem; padding-bottom: 3.5rem; }
+[data-testid="stSidebar"] { background: #fff; border-right: 1px solid var(--line); }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: var(--muted); }
+h1, h2, h3, h4 { color: var(--ink) !important; letter-spacing: -.025em; }
+h1 { font-weight: 750 !important; }
+h2, h3 { font-weight: 700 !important; }
+p, label, li { color: #334155; }
+[data-testid="stCaptionContainer"] { color: var(--muted); }
+div[class*="st-key-"][class*="-card"] { background: #fff; border-radius: var(--radius); border-color: var(--line); }
+[data-testid="stMetric"] {
+  background: var(--paper); border: 1px solid var(--line); border-radius: 16px;
+  padding: 15px 18px; box-shadow: 0 5px 18px rgba(19,43,74,.035);
+}
+[data-testid="stMetricLabel"] p { color: var(--muted) !important; font-size: .83rem; }
+[data-testid="stMetricValue"] { color: var(--navy) !important; font-weight: 750; }
+[data-testid="stExpander"] { background: #fff; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+[data-testid="stForm"] { border-color: var(--line) !important; border-radius: 14px !important; background: #fff; }
+[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+[data-testid="stFileUploaderDropzone"] { background: #fbfdff; border: 1.5px dashed #b8c7d9; border-radius: 15px; }
+[data-testid="stAlert"] { border-radius: 12px; }
+.stButton > button, [data-testid="stFormSubmitButton"] > button {
+  border-radius: 11px; min-height: 2.7rem; font-weight: 650;
+  transition: transform .12s ease, box-shadow .12s ease;
+}
+.stButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {
+  transform: translateY(-1px); box-shadow: 0 5px 14px rgba(23,54,93,.12);
+}
+.stButton > button:focus-visible, [data-testid="stFormSubmitButton"] > button:focus-visible {
+  outline: 2px solid var(--teal); outline-offset: 2px;
+}
+button[kind="primary"], [data-testid="stFormSubmitButton"] button[kind="primary"] {
+  background: var(--navy) !important; border-color: var(--navy) !important; color: white !important;
+}
+[data-baseweb="input"] > div, [data-baseweb="select"] > div, [data-testid="stDateInput"] input,
+[data-testid="stTimeInput"] input { border-radius: 10px; }
+.brand-lockup { display:flex; align-items:center; gap:14px; margin: 0 0 1.6rem 0; }
+.brand-name { font-weight: 800; color: var(--ink); font-size: 1rem; }
+.brand-sub { font-size: .75rem; color: var(--muted); }
+.brand-mark { width:48px; height:48px; display:flex; align-items:center; justify-content:center;
+  border-radius:15px; color:#fff; font-size:24px; font-weight:800; background:linear-gradient(140deg,#17365d,#267f83);
+  box-shadow:0 8px 20px rgba(23,54,93,.18); flex-shrink:0; }
+.eyebrow { text-transform:uppercase; letter-spacing:.15em; font-size:.70rem; font-weight:800; color:var(--teal); margin-bottom:7px; }
+.hero-title { color:var(--ink); font-size:clamp(1.8rem, 3vw, 2.6rem); font-weight:800; line-height:1.1; letter-spacing:-.04em; }
+.hero-copy { color:var(--muted); font-size:1rem; margin-top:9px; max-width:850px; line-height:1.55; }
+.hero-shell { background:linear-gradient(115deg,#fff 10%,#f7fafc 65%,#edf5f5 100%); border:1px solid var(--line);
+  border-radius:22px; padding:25px 28px; margin-bottom:22px; box-shadow:0 8px 26px rgba(19,43,74,.035); }
+.hero-row { display:flex; align-items:flex-start; gap:17px; }
+.hero-mark { width:56px; height:56px; border-radius:17px; flex-shrink:0; display:flex; align-items:center; justify-content:center;
+  background:var(--navy); color:white; font-size:27px; box-shadow:0 8px 20px rgba(23,54,93,.15); }
+.role-pill { display:inline-block; background:#e9f3f2; color:#126b65; border:1px solid #cee5e2; border-radius:999px;
+  padding:5px 10px; font-size:.75rem; font-weight:750; letter-spacing:.02em; }
+.section-heading { display:flex; align-items:flex-start; gap:13px; padding:3px 0 8px 0; margin-bottom:8px; }
+.section-number { min-width:38px; height:38px; display:flex; align-items:center; justify-content:center; border-radius:12px;
+  background:#eaf0f8; color:var(--navy); font-size:.84rem; font-weight:850; }
+.section-title { color:var(--ink); font-size:1.24rem; font-weight:780; letter-spacing:-.025em; margin-top:1px; }
+.section-copy { color:var(--muted); margin-top:4px; font-size:.91rem; line-height:1.5; }
+.workflow { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin: 0 0 24px 0; }
+.workflow-step { display:flex; align-items:center; gap:10px; padding:12px 13px; border-radius:13px; border:1px solid var(--line); background:#fff; min-height:63px; }
+.workflow-dot { width:29px; height:29px; display:flex; align-items:center; justify-content:center; border-radius:50%; background:#eef2f7; color:#5f6f85; font-size:.76rem; font-weight:800; flex-shrink:0; }
+.workflow-label { color:var(--step-ink); font-size:.82rem; font-weight:680; line-height:1.25; }
+.workflow-step.done { background:var(--ok-bg); border-color:var(--ok-line); }
+.workflow-step.done .workflow-dot { background:var(--teal); color:#fff; }
+.workflow-step.done .workflow-label { color:var(--ok-ink); }
+.workflow-step.current { border-color:#9db4d1; box-shadow:inset 0 0 0 1px #d8e3ef; }
+.workflow-step.current .workflow-dot { background:var(--navy); color:#fff; }
+@media (max-width: 820px) { .workflow { grid-template-columns:repeat(2,minmax(0,1fr)); } .hero-shell { padding:20px; } .block-container { padding-top:1rem; } }
+@media (max-width: 480px) { .hero-mark { width:45px; height:45px; } }
+@media (prefers-reduced-motion: reduce) { .stButton > button, [data-testid="stFormSubmitButton"] > button { transition: none; transform: none !important; } }
+"""
+st.markdown(f"<style>\n{APP_CSS}\n</style>", unsafe_allow_html=True)
 
 DB_PATH = Path(os.environ.get("USERS_DB_PATH", "users_db.json"))
 _DB_LOCK = threading.Lock()
 
-PBKDF2_ITERATIONS = 210_000
+PBKDF2_ITERATIONS = 600_000
 MAX_FAILED_ATTEMPTS = 5
-LOCKOUT_SECONDS = 60
+LOCKOUT_SECONDS = 120
+FAIL_WINDOW_SECONDS = 900
 MIN_PASSWORD_LEN = 8
 USERNAME_RE = re.compile(r"^[a-z0-9_-]{3,32}$")
 LOGIN_ERROR = "Acceso no autorizado o usuario desactivado"
 
 DAYS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 AREAS = ["atencion", "barra", "cocina", "Omitir"]
-# Porcentajes iniciales sugeridos (solo valores por defecto de la interfaz). El cálculo usa los configurados.
 DEFAULT_PCTS = {"atencion": 70.0, "barra": 10.0, "cocina": 20.0}
 PCT_AREAS = [("atencion", "Atención / Garzones"), ("barra", "Barra"), ("cocina", "Cocina")]
 AREA_ORDER = ["atencion", "cocina", "barra"]
 TURNO_ORDER = {"Día": 0, "Noche": 1, "Único": 2, "Día completo": 3}
 
-# Descuento "Alfredo": monto por cada día de asistencia de lunes a sábado, según el área de ese día.
-# atencion = Garzón / Garzona. Cocina no tiene descuento.
-DEFAULT_ALFREDO = {"atencion": 500, "barra": 100}  # valores iniciales de la interfaz (editables por sucursal)
+DEFAULT_ALFREDO = {"atencion": 500, "barra": 100}
 ALFREDO_AREAS = [("atencion", "Garzón / Garzona"), ("barra", "Barra")]
 ALFREDO_WEEKDAYS = range(0, 6)  # 0 = Lunes ... 5 = Sábado
 
 REPLACEMENT_AREAS = ["atencion", "barra", "cocina"]
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-MAX_EMAILS_PER_SESSION = 30
+MAX_EMAILS_PER_USER_HOUR = 20
+MAX_EMAILS_GLOBAL_HOUR = 60
+
+DAY_SECONDS = 86400
+EARLY_CUTOFF = 5 * 3600  # marcas antes de las 05:00 pueden ser la salida de un turno de la noche anterior
+MAX_SHIFT_SECONDS = 16 * 3600
+
+
+# ============================================================================
+# LECTURA DEL EXCEL DE ASISTENCIA (antes en attendance_import.py)
+# ============================================================================
+def norm(s) -> str:
+    """Minúsculas, sin tildes y sin espacios sobrantes (para buscar y comparar)."""
+    s = "" if s is None else str(s)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return " ".join(s.casefold().split())
+
+
+def parse_time(v):
+    """Convierte hora (time, datetime, fracción de día de Excel o texto 'HH:MM') a segundos desde medianoche."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, np.datetime64):
+        v = pd.Timestamp(v)
+    if isinstance(v, datetime):
+        return v.hour * 3600 + v.minute * 60 + v.second
+    if isinstance(v, dtime):
+        return v.hour * 3600 + v.minute * 60 + v.second
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        v = float(v)
+        if 0 <= v < 1:
+            sec = int(round(v * DAY_SECONDS))
+        elif 1 <= v < 80000 and v - int(v) > 0:
+            sec = int(round((v - int(v)) * DAY_SECONDS))
+        else:
+            return None
+        return sec % DAY_SECONDS
+    s = str(v).strip()
+    if not s:
+        return None
+    m = re.match(r"^(\d{1,2})\s*[:.hH]\s*(\d{2})(?:\s*[:.]\s*(\d{2}))?\s*([aApP]\.?[mM]\.?)?$", s)
+    if not m:  # texto con fecha y hora (p. ej. 1970-01-01T18:00:00): se toma la hora
+        m = re.search(r"[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?", s)
+    if not m:
+        return None
+    hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+    ampm = ((m.group(4) if m.re.groups >= 4 else "") or "").lower().replace(".", "")
+    if ampm == "pm" and hh < 12:
+        hh += 12
+    if ampm == "am" and hh == 12:
+        hh = 0
+    if hh > 23 or mm > 59 or ss > 59:
+        return None
+    return hh * 3600 + mm * 60 + ss
+
+
+def parse_date(v):
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        if 30000 < v < 80000:
+            return date(1899, 12, 30) + timedelta(days=int(v))
+        return None
+    s = str(v).strip().split(" ")[0] if str(v).strip() else ""
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%y", "%d/%m/%y", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def read_marks(file_bytes: bytes):
+    """
+    Lee el Excel (columnas Nombre, Fecha, Hora; una fila por marca).
+    Devuelve (marks, empties, skipped, sheet):
+      marks   = [(nombre, fecha, segundos)]
+      empties = [(nombre, fecha)]  filas con hora vacía
+      skipped = filas ignoradas por nombre o fecha inválidos
+      sheet   = nombre de la hoja usada
+    """
+    sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None, dtype=object)
+    wanted = {"nombre", "fecha", "hora"}
+    for sheet_name, raw in sheets.items():
+        header_row, cols = None, {}
+        for i in range(min(15, len(raw))):
+            found = {norm(v): j for j, v in enumerate(raw.iloc[i].tolist()) if not is_missing(v)}
+            if wanted <= set(found):
+                header_row, cols = i, found
+                break
+        if header_row is None:
+            continue
+        marks, empties, skipped = [], [], 0
+        canonical = {}
+        for rec in raw.iloc[header_row + 1:].itertuples(index=False):
+            name_raw, date_raw, time_raw = rec[cols["nombre"]], rec[cols["fecha"]], rec[cols["hora"]]
+            if all(is_missing(x) or str(x).strip() == "" for x in (name_raw, date_raw, time_raw)):
+                continue  # fila completamente vacía
+            name = " ".join(str(name_raw).split()) if not is_missing(name_raw) else ""
+            d = parse_date(date_raw)
+            if not name or d is None:
+                skipped += 1
+                continue
+            name = canonical.setdefault(name.casefold(), name)  # "ANA" y "Ana" son la misma persona
+            sec = parse_time(time_raw)
+            if sec is None:
+                empties.append((name, d))
+            else:
+                marks.append((name, d, sec))
+        return marks, empties, skipped, str(sheet_name)
+    raise ValueError("No encontré las columnas Nombre, Fecha y Hora en ninguna hoja del archivo.")
 
 
 # ============================================================================
@@ -123,11 +360,18 @@ def hash_password(password: str) -> str:
 
 def _verify_hash(password: str, stored: str) -> bool:
     try:
-        algo, iters, salt_hex, hash_hex = stored.split("$")
+        algo, iters_raw, salt_hex, hash_hex = stored.split("$")
         if algo != "pbkdf2_sha256":
             return False
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iters))
-        return hmac.compare_digest(dk, bytes.fromhex(hash_hex))
+        iters = int(iters_raw)
+        if not 100_000 <= iters <= 1_000_000:
+            return False
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hash_hex)
+        if len(salt) < 16 or len(expected) != 32:
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters)
+        return hmac.compare_digest(dk, expected)
     except (ValueError, TypeError):
         return False
 
@@ -135,12 +379,75 @@ def _verify_hash(password: str, stored: str) -> bool:
 def verify_password(record: dict, password: str) -> bool:
     if record.get("password_hash"):
         return _verify_hash(password, str(record["password_hash"]))
-    if record.get("password") is not None:  # contraseña en texto plano definida en st.secrets
+    if record.get("password") is not None:
         return hmac.compare_digest(str(record["password"]).encode("utf-8"), password.encode("utf-8"))
     return False
 
 
-_DUMMY_HASH = hash_password("dummy-password")  # iguala tiempos cuando el usuario no existe
+@st.cache_resource
+def _dummy_hash() -> str:
+    """Hash de relleno para igualar tiempos cuando el usuario no existe (se calcula una sola vez)."""
+    return hash_password("dummy-password")
+
+
+# ============================================================================
+# LÍMITES EN EL SERVIDOR (intentos de login y correos): sobreviven a refrescar la página
+# ============================================================================
+@st.cache_resource
+def _guard_store() -> dict:
+    return {"lock": threading.Lock(), "fails": {}, "emails": []}
+
+
+def _fail_key(username: str) -> str:
+    return username.strip().lower()[:64]
+
+
+def lock_remaining(username: str) -> int:
+    store = _guard_store()
+    with store["lock"]:
+        rec = store["fails"].get(_fail_key(username))
+        if not rec:
+            return 0
+        return max(0, math.ceil(rec["until"] - time.time()))
+
+
+def register_failure(username: str) -> None:
+    store, now = _guard_store(), time.time()
+    with store["lock"]:
+        fails = store["fails"]
+        if len(fails) > 5000:  # evita que crezca sin límite
+            for k in [k for k, v in fails.items() if now - v["last"] > FAIL_WINDOW_SECONDS and v["until"] < now]:
+                fails.pop(k, None)
+        key = _fail_key(username)
+        rec = fails.get(key)
+        if not rec or now - rec["last"] > FAIL_WINDOW_SECONDS:
+            rec = {"n": 0, "until": 0.0, "last": now}
+        rec["n"] += 1
+        rec["last"] = now
+        if rec["n"] >= MAX_FAILED_ATTEMPTS:
+            rec["until"] = now + LOCKOUT_SECONDS
+            rec["n"] = 0
+        fails[key] = rec
+
+
+def clear_failures(username: str) -> None:
+    store = _guard_store()
+    with store["lock"]:
+        store["fails"].pop(_fail_key(username), None)
+
+
+def email_quota_ok(user: str) -> bool:
+    store, now = _guard_store(), time.time()
+    with store["lock"]:
+        store["emails"] = [(t, u) for t, u in store["emails"] if now - t < 3600]
+        mine = sum(1 for _t, u in store["emails"] if u == user)
+        return mine < MAX_EMAILS_PER_USER_HOUR and len(store["emails"]) < MAX_EMAILS_GLOBAL_HOUR
+
+
+def register_email(user: str) -> None:
+    store = _guard_store()
+    with store["lock"]:
+        store["emails"].append((time.time(), user))
 
 
 # ============================================================================
@@ -185,7 +492,6 @@ def _valid_alfredo(r) -> bool:
 
 
 def _alfredo_from_cfg(cfg: dict):
-    """Montos de Alfredo definidos en st.secrets: alfredo_atencion, alfredo_barra (opcionales)."""
     r = {a: cfg.get(f"alfredo_{a}") for a, _ in ALFREDO_AREAS}
     return {a: int(float(v)) for a, v in r.items()} if _valid_alfredo(r) else None
 
@@ -196,7 +502,6 @@ def branch_alfredo(rec) -> dict:
 
 
 def _pcts_from_cfg(cfg: dict):
-    """Porcentajes definidos en st.secrets: pct_atencion, pct_barra, pct_cocina (opcionales)."""
     p = {a: cfg.get(f"pct_{a}") for a, _ in PCT_AREAS}
     return {a: float(v) for a, v in p.items()} if _valid_pcts(p) else None
 
@@ -240,15 +545,17 @@ def _write_overlay(data: dict) -> None:
 
 def load_users() -> dict:
     """Usuarios SUCURSAL: base de st.secrets + cambios guardados desde el panel."""
-    users = _secret_users()
-    for uname, ov in _read_overlay().items():
+    secret_users = _secret_users()
+    users = dict(secret_users)
+    overlay = _read_overlay()
+    for uname, ov in overlay.items():
         rec = dict(users.get(uname, {"name": uname, "password": None, "password_hash": None, "active": True}))
         rec.update({k: v for k, v in ov.items() if k in ("name", "password_hash", "active", "pcts", "alfredo")})
         if "password_hash" in ov:
             rec["password"] = None
         users[uname] = rec
-    secret_names = set(_secret_users())
-    overlay_names = set(_read_overlay())
+    secret_names = set(secret_users)
+    overlay_names = set(overlay)
     for uname, rec in users.items():
         if uname in secret_names and uname in overlay_names:
             rec["source"] = "secrets + panel"
@@ -290,7 +597,6 @@ def get_branch_pcts(username: str) -> dict:
 
 
 def set_pcts(uname: str, pcts: dict) -> str | None:
-    """Guarda los porcentajes de reparto de una sucursal (deben sumar exactamente 100)."""
     if not _valid_pcts(pcts):
         return "Los porcentajes deben estar entre 0 y 100 y sumar exactamente 100%."
     try:
@@ -305,7 +611,6 @@ def get_branch_alfredo(username: str) -> dict:
 
 
 def set_alfredo(uname: str, rates: dict) -> str | None:
-    """Guarda los montos de Alfredo de una sucursal (enteros entre 0 y 100.000)."""
     if not _valid_alfredo(rates):
         return "Los montos deben ser números entre 0 y 100.000."
     try:
@@ -341,7 +646,13 @@ def build_secrets_toml(users: dict) -> str:
     lines = ["# Pega este bloque en Settings > Secrets (junto a la sección [admin]).", ""]
     for uname in sorted(users):
         rec = users[uname]
-        pw_hash = rec.get("password_hash") or hash_password(str(rec.get("password") or ""))
+        if rec.get("password_hash"):
+            pw_hash = rec["password_hash"]
+        elif rec.get("password"):
+            pw_hash = hash_password(str(rec["password"]))
+        else:  # sin contraseña: no se exporta (evitaría dejar una cuenta con clave vacía)
+            lines += [f"# Se omitió '{uname}': no tiene contraseña definida.", ""]
+            continue
         lines += [
             f"[users.{uname}]",
             f'name = "{_toml_str(rec["name"])}"',
@@ -356,6 +667,55 @@ def build_secrets_toml(users: dict) -> str:
     return "\n".join(lines)
 
 
+def render_hero(eyebrow: str, title: str, subtitle: str, role: str | None = None):
+    role_html = f'<div style="margin-top:12px"><span class="role-pill">{html.escape(role)}</span></div>' if role else ""
+    st.markdown(
+        f"""
+        <div class="hero-shell">
+          <div class="hero-row">
+            <div class="hero-mark">✦</div>
+            <div>
+              <div class="eyebrow">{html.escape(eyebrow)}</div>
+              <div class="hero-title">{html.escape(title)}</div>
+              <div class="hero-copy">{html.escape(subtitle)}</div>
+              {role_html}
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_section_heading(number: str, title: str, subtitle: str = ""):
+    desc = f'<div class="section-copy">{html.escape(subtitle)}</div>' if subtitle else ""
+    st.markdown(
+        f'<div class="section-heading"><div class="section-number">{html.escape(number)}</div>'
+        f'<div><div class="section-title">{html.escape(title)}</div>{desc}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_workflow_progress():
+    has_file = st.session_state.get("attendance") is not None
+    has_workers = st.session_state.get("workers_df") is not None
+    tip_keys = [f"tip_{mode}_{i}" for mode in "udn" for i in range(7)]
+    has_tips = any(int(st.session_state.get(k, 0) or 0) > 0 for k in tip_keys)
+    has_result = st.session_state.get("result") is not None
+    states = [has_file, has_workers, has_tips, has_result]
+    labels = ["Cargar asistencia", "Configurar equipo", "Ingresar propinas", "Revisar resultados"]
+    current = next((i for i, done in enumerate(states) if not done), 3)
+    bits = []
+    for i, (label, done) in enumerate(zip(labels, states)):
+        cls = "done" if done else ("current" if i == current else "")
+        mark = "✓" if done else f"{i + 1:02d}"
+        bits.append(
+            f'<div class="workflow-step {cls}"><div class="workflow-dot">{mark}</div>'
+            f'<div class="workflow-label">{html.escape(label)}</div></div>'
+        )
+    st.markdown('<div class="workflow">' + "".join(bits) + '</div>', unsafe_allow_html=True)
+
+
 # ============================================================================
 # AUTENTICACIÓN Y SESIÓN
 # ============================================================================
@@ -368,7 +728,7 @@ def authenticate(username: str, password: str):
         return None
     rec = load_users().get(uname)
     if rec is None:
-        _verify_hash(password, _DUMMY_HASH)
+        _verify_hash(password, _dummy_hash())
         return None
     if verify_password(rec, password) and rec["active"]:
         return {"username": uname, "name": rec["name"], "role": "sucursal"}
@@ -376,8 +736,7 @@ def authenticate(username: str, password: str):
 
 
 def current_user():
-    """Devuelve la sesión activa. Revalida en cada interacción: si la sucursal fue
-    desactivada o eliminada, la sesión se cierra de inmediato."""
+    """Sesión activa, revalidada en cada interacción: si la sucursal fue desactivada, se cierra."""
     auth = st.session_state.get("auth")
     if not auth:
         return None
@@ -401,10 +760,17 @@ def logout():
 
 
 def render_login():
-    _, col, _ = st.columns([1, 1.2, 1])
+    _, col, _ = st.columns([1, 1.15, 1])
     with col:
-        st.title("Filtrado y Cálculo de Propinas")
-        st.caption("Inicia sesión con el usuario de tu sucursal.")
+        st.markdown(
+            '<div style="padding: 7vh 0 8px 0; text-align:center">'
+            '<div class="brand-mark" style="margin:0 auto 18px auto;width:62px;height:62px;font-size:28px">✦</div>'
+            '<div class="eyebrow">GESTIÓN OPERATIVA</div>'
+            '<div class="hero-title" style="font-size:2rem">Control de propinas</div>'
+            '<div class="hero-copy" style="margin:10px auto 25px auto;text-align:center">'
+            'Una vista clara del equipo, los turnos y la distribución semanal.</div></div>',
+            unsafe_allow_html=True,
+        )
 
         if get_admin() is None:
             st.error(
@@ -416,116 +782,24 @@ def render_login():
         if st.session_state.pop("login_error", False):
             st.error(LOGIN_ERROR)
 
-        wait = st.session_state.get("lock_until", 0) - time.time()
         with st.form("login_form"):
             username = st.text_input("Nombre de Usuario / Sucursal", autocomplete="username")
             password = st.text_input("Contraseña", type="password", autocomplete="current-password")
             submitted = st.form_submit_button("Iniciar Sesión")
 
         if submitted:
+            wait = lock_remaining(username)
             if wait > 0:
-                st.error(f"Demasiados intentos fallidos. Espera {math.ceil(wait)} segundos.")
+                st.error(f"Demasiados intentos fallidos. Espera {wait} segundos.")
                 return
             user = authenticate(username, password)
             if user:
+                clear_failures(username)
                 st.session_state.clear()
                 st.session_state["auth"] = user
                 st.rerun()
-            fails = st.session_state.get("fails", 0) + 1
-            st.session_state["fails"] = fails
-            if fails >= MAX_FAILED_ATTEMPTS:
-                st.session_state["lock_until"] = time.time() + LOCKOUT_SECONDS
-                st.session_state["fails"] = 0
+            register_failure(username)
             st.error(LOGIN_ERROR)
-
-
-# ============================================================================
-# HERRAMIENTA: LECTURA DEL EXCEL
-# ============================================================================
-def norm(s) -> str:
-    s = "" if s is None or (not isinstance(s, str) and pd.isna(s)) else str(s)
-    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn").strip().lower()
-
-
-def parse_date(v):
-    if v is None or (not isinstance(v, str) and pd.isna(v)):
-        return None
-    if isinstance(v, datetime):
-        return v.date()
-    if isinstance(v, date):
-        return v
-    if isinstance(v, numbers.Real) and not isinstance(v, bool):
-        return date(1899, 12, 30) + timedelta(days=int(math.floor(v)))
-    s = str(v).strip()
-    try:
-        m = re.match(r"^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})", s)
-        if m:
-            return date(int(m[1]), int(m[2]), int(m[3]))
-        m = re.match(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})", s)
-        if m:
-            y = int(m[3]) + (2000 if int(m[3]) < 100 else 0)
-            return date(y, int(m[2]), int(m[1]))
-    except ValueError:
-        return None
-    return None
-
-
-def parse_time(v):
-    """Devuelve segundos desde medianoche, o None."""
-    if v is None or (not isinstance(v, str) and pd.isna(v)):
-        return None
-    if isinstance(v, (datetime, dtime)):
-        return v.hour * 3600 + v.minute * 60 + v.second
-    if isinstance(v, numbers.Real) and not isinstance(v, bool):
-        return int(round((v - math.floor(v)) * 86400))
-    m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([apAP])?\.?[mM]?\.?", str(v).strip())
-    if not m:
-        return None
-    h, mi, sec = int(m[1]), int(m[2]), int(m[3] or 0)
-    if m[4]:
-        pm = m[4].lower() == "p"
-        if pm and h < 12:
-            h += 12
-        if not pm and h == 12:
-            h = 0
-    if h > 23 or mi > 59:
-        return None
-    return h * 3600 + mi * 60 + sec
-
-
-def read_marks(file_bytes: bytes):
-    xls = pd.ExcelFile(io.BytesIO(file_bytes))
-    for sheet in xls.sheet_names:
-        raw = xls.parse(sheet, header=None, dtype=object)
-        for r in range(min(len(raw), 25)):
-            cells = [norm(c) for c in raw.iloc[r].tolist()]
-            if "nombre" not in cells or "fecha" not in cells:
-                continue
-            i_n, i_f = cells.index("nombre"), cells.index("fecha")
-            i_h = cells.index("hora") if "hora" in cells else None
-            marks, empties, skipped = [], [], 0
-            for i in range(r + 1, len(raw)):
-                row = raw.iloc[i].tolist()
-                name_v = row[i_n]
-                name = " ".join(str(name_v).split()) if not pd.isna(name_v) else ""
-                if not name:
-                    if any(not pd.isna(c) for c in row):
-                        skipped += 1
-                    continue
-                d = parse_date(row[i_f])
-                sec = parse_time(row[i_h]) if i_h is not None else None
-                if sec is None and isinstance(row[i_f], (datetime, numbers.Real)):
-                    alt = parse_time(row[i_f])  # fecha y hora en la misma celda (0 = solo fecha)
-                    sec = alt if alt else None
-                if d is None:
-                    skipped += 1
-                    continue
-                if sec is None:
-                    empties.append((name, d))  # marca con la hora vacía: se corrige en la tabla de excepciones
-                    continue
-                marks.append((name, d, sec))
-            return marks, empties, skipped, sheet
-    raise ValueError('No encontré las columnas "Nombre", "Fecha" y "Hora" en el archivo.')
 
 
 # ============================================================================
@@ -542,19 +816,43 @@ def is_missing(v) -> bool:
 def sec_to_time(sec):
     if is_missing(sec):
         return None
-    sec = int(sec)
+    sec = int(sec) % DAY_SECONDS
     return dtime(sec // 3600, (sec % 3600) // 60, sec % 60)
 
 
 def to_date(v):
-    return v.date() if isinstance(v, datetime) else v
+    """Normaliza a datetime.date (acepta date, datetime, Timestamp, datetime64 y texto)."""
+    if isinstance(v, np.datetime64):
+        v = pd.Timestamp(v)
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    return parse_date(v) or v
+
+
+def hhmm(sec: int) -> str:
+    base = f"{(sec % DAY_SECONDS) // 3600:02d}:{(sec % 3600) // 60:02d}"
+    return base + " (+1 día)" if sec >= DAY_SECONDS else base
+
+
+def normalize_slots(vals: list) -> list:
+    """Si una marca es menor o igual a la anterior pero razonable al día siguiente, se entiende que cruzó medianoche."""
+    out, prev = [], None
+    for v in vals:
+        if v is None:
+            out.append(None)
+            continue
+        v = int(v)
+        if prev is not None and v <= prev and v + DAY_SECONDS - prev <= MAX_SHIFT_SECONDS:
+            v += DAY_SECONDS
+        out.append(v)
+        prev = v
+    return out
 
 
 def slot_problems(vals) -> list:
-    """
-    Valida un día con el esquema fijo [Entrada 1, Salida 1, Entrada 2, Salida 2].
-    Es válido tener solo la jornada 1 (Entrada 2 y Salida 2 vacías) o las dos jornadas completas.
-    """
+    """Valida un día con el esquema [Entrada 1, Salida 1, Entrada 2, Salida 2]."""
     e1, s1, e2, s2 = [None if is_missing(v) else int(v) for v in vals]
     if e1 is None and s1 is None and e2 is None and s2 is None:
         return ["Sin marcas"]
@@ -587,23 +885,40 @@ def problem_text(rec: dict) -> str:
     return "; ".join(parts)
 
 
+def assign_marks_to_days(marks) -> dict:
+    """
+    Agrupa las marcas por (nombre, fecha). Una marca de madrugada (antes de las 05:00) se asigna al
+    día anterior si ese día quedó con una marca abierta (cantidad impar): es la salida de un turno nocturno.
+    Los segundos de esas marcas se guardan sumando 24 h (ej.: 01:00 -> 25:00).
+    """
+    times_by = defaultdict(set)
+    for name, d, sec in marks:
+        times_by[(name, d)].add(sec)
+    final = {}
+    for name, d in sorted(times_by, key=lambda k: (k[0].casefold(), k[1])):
+        ts = sorted(times_by[(name, d)])
+        prev = final.get((name, d - timedelta(days=1)))
+        if prev is not None and len(prev) % 2 == 1 and ts and ts[0] < EARLY_CUTOFF:
+            prev.append(ts.pop(0) + DAY_SECONDS)
+            prev.sort()
+        final[(name, d)] = ts
+    return final
+
+
 def build_attendance(marks, empties) -> pd.DataFrame:
     """
     DataFrame principal: UNA fila por trabajador y fecha, con 4 columnas fijas de tiempo
-    (Entrada 1, Salida 1, Entrada 2, Salida 2), en segundos desde medianoche (o None si falta).
-
-    Las marcas del día se ordenan y se asignan en ese orden a las 4 columnas. Si hay menos de 4,
-    las últimas columnas quedan vacías; si hay más de 4, se usan las 4 primeras y se deja una
-    Nota para revisión. 'Marcas originales' conserva todas las horas que traía el archivo.
+    (Entrada 1, Salida 1, Entrada 2, Salida 2) en segundos desde medianoche (pueden pasar de 86400
+    si la salida fue de madrugada). Si hay más de 4 marcas se usan las 4 primeras y se deja una Nota.
     """
-    valid, blank = defaultdict(set), defaultdict(int)
-    for name, d, sec in marks:
-        valid[(name, d)].add(sec)
+    valid = assign_marks_to_days(marks)
+    blank = defaultdict(int)
     for name, d in empties:
         blank[(name, d)] += 1
 
+    keys = {k for k, v in valid.items() if v} | set(blank)
     rows = []
-    for (name, d) in sorted(set(valid) | set(blank), key=lambda k: (k[1], k[0].casefold())):
+    for (name, d) in sorted(keys, key=lambda k: (k[1], k[0].casefold())):
         times = sorted(valid.get((name, d), ()))
         n_blank = blank.get((name, d), 0)
         slots = (times[:4] + [None] * 4)[:4]
@@ -632,7 +947,6 @@ def review_mask(df: pd.DataFrame) -> pd.Series:
 
 
 def apply_corrections(main: pd.DataFrame, fixes: dict) -> pd.DataFrame:
-    """Integra las correcciones guardadas al DataFrame principal (y quita los días descartados)."""
     out = []
     for rec in main.to_dict("records"):
         if needs_review(rec):
@@ -646,10 +960,7 @@ def apply_corrections(main: pd.DataFrame, fixes: dict) -> pd.DataFrame:
 
 
 def resolve_pairs(final: pd.DataFrame):
-    """
-    Convierte cada día en sus intervalos [Entrada 1 -> Salida 1] y [Entrada 2 -> Salida 2].
-    La jornada 2 se omite si sus dos celdas están vacías. Los días con problemas quedan pendientes.
-    """
+    """Convierte cada día en intervalos [Entrada 1 -> Salida 1] y [Entrada 2 -> Salida 2]."""
     pairs, pending = [], []
     for rec in final.to_dict("records"):
         vals = [rec[c] for c in SLOTS]
@@ -664,7 +975,6 @@ def resolve_pairs(final: pd.DataFrame):
 
 
 def render_missing_marks():
-    """Muestra SOLO los días con marcas faltantes o por revisar y permite completarlos."""
     att = st.session_state.get("attendance")
     if att is None or att.empty:
         return
@@ -681,7 +991,8 @@ def render_missing_marks():
         "Cada día admite hasta 4 marcas: Entrada 1, Salida 1, Entrada 2 y Salida 2. "
         "La columna Marcas originales muestra las horas que venían en el archivo, ya cargadas en las columnas de la derecha. "
         "Completa lo que falte; si no hubo segunda jornada, deja Entrada 2 y Salida 2 vacías. "
-        "Si una marca quedó en una columna equivocada, muévela. Marca Descartar para ignorar todo ese día."
+        "Si una salida fue después de medianoche, escribe la hora normal (ej. 01:00): se entiende como del día siguiente. "
+        "Marca Descartar para ignorar todo ese día."
     )
 
     recs = flagged.to_dict("records")
@@ -714,13 +1025,15 @@ def render_missing_marks():
         saved = st.form_submit_button("Guardar correcciones", type="primary")
 
     if saved:
-        st.session_state["fixes"] = {
-            (rec["Nombre"], to_date(rec["Fecha"])): {
-                "s": [parse_time(rec[c]) for c in SLOTS],
-                "drop": bool(rec["Descartar"]),
+        # La clave sale de la fila ORIGINAL (misma posición), no de lo que devuelva el editor.
+        new_fixes = {}
+        for pos, (_idx, row) in enumerate(edited.iterrows()):
+            src = recs[pos]
+            new_fixes[(src["Nombre"], to_date(src["Fecha"]))] = {
+                "s": normalize_slots([parse_time(row[c]) for c in SLOTS]),
+                "drop": bool(row["Descartar"]),
             }
-            for rec in edited.to_dict("records")
-        }
+        st.session_state["fixes"] = new_fixes
 
     fixes = st.session_state.get("fixes")
     if fixes is None:
@@ -731,6 +1044,13 @@ def render_missing_marks():
             st.warning(
                 f"Quedan {len(pending)} días sin resolver: faltan marcas o están fuera de orden. "
                 "Complétalos o márcalos como Descartar, y vuelve a guardar."
+            )
+            st.dataframe(
+                pd.DataFrame([
+                    {"Nombre": r["Nombre"], "Fecha": fmt_date(to_date(r["Fecha"])), "Qué falta": problem_text(r)}
+                    for r in pending
+                ]),
+                hide_index=True, width="stretch",
             )
         else:
             st.success("Todos los registros fueron resueltos y se integraron a los datos. Ya puedes calcular.")
@@ -751,35 +1071,19 @@ def fmt_date(d: date) -> str:
     return d.strftime("%d-%m-%Y")
 
 
-def hhmm(sec: int) -> str:
-    return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}"
-
-
 def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dict, alfredo_rates: dict,
             adjustments=None, extra_hours=None) -> dict:
     """
     modes[i] = True  -> el día i (0 = Lunes) está en Modo Pozo Único.
     modes[i] = False -> el día i está en Modo Turnos (Día / Noche según la hora de corte).
 
-    areas = {nombre: [área_lunes, ..., área_domingo]}: cada persona tiene una lista de 7 áreas, una por
-    día de la semana (weekday). Una persona con área mixta puede tener áreas distintas según el día;
-    "Omitir" excluye ese día del reparto.
+    areas = {nombre: [área_lunes, ..., área_domingo]}; "Omitir" excluye ese día del reparto.
 
-    Reglas de reparto:
-      * atención y barra: por turno en Modo Turnos; por día entero en Pozo Único.
-      * cocina: SIEMPRE por día entero, sobre el pozo total del día (Día + Noche o Pozo Único).
+    Reglas: atención y barra por turno (o por día entero en Pozo Único); cocina SIEMPRE por día entero.
+    Las propinas se reparten en pesos enteros con el método del mayor residuo: la suma de cada grupo
+    coincide exactamente con su pozo (sin diferencias de redondeo).
 
-    pcts = {"atencion": fracción, "barra": fracción, "cocina": fracción}: porcentaje del pozo que recibe cada
-    área (configurado en la interfaz; deben sumar exactamente 1). Un área en 0 no recibe nada.
-
-    adjustments = [{"name", "date", "turno", "minutes", "note"}]: ajustes manuales (minutos con signo) que
-    se suman o restan a las horas de esa persona en ese día (y turno) ANTES de repartir las propinas.
-
-    extra_hours = [{"name", "date", "turno", "hours"}]: horas de reemplazos / personal sin marcaje (cargadas a
-    mano). Participan en el reparto y en el descuento Alfredo igual que quienes marcan en el reloj.
-
-    Descuento Alfredo: por cada día de asistencia de lunes a sábado se descuenta el monto configurado (alfredo_rates) según el área
-    que la persona tuvo ese día (atención 500, barra 100). Se resta del total en el resumen por persona.
+    Descuento Alfredo: por cada día de asistencia de lunes a sábado se descuenta el monto configurado según el área.
     """
     missing_pct = [a for a in AREA_ORDER if a not in pcts]
     if missing_pct or any(v < 0 for v in pcts.values()) or abs(sum(pcts.values()) - 1) > 1e-9:
@@ -789,7 +1093,6 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
         raise ValueError("Los montos de Alfredo deben ser números mayores o iguales a 0.")
 
     def area_of(name: str, d: date) -> str:
-        """Área de la persona en el día de la semana de la fecha d."""
         week = areas.get(name)
         return week[d.weekday()] if week else "Omitir"
 
@@ -797,6 +1100,18 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
         raise ValueError("No hay tramos completos (entrada y salida) para calcular.")
     if all(a == "Omitir" for week in areas.values() for a in week):
         raise ValueError('Todos los trabajadores están en "Omitir". Asigna un área al menos a uno.')
+
+    # Una sola semana: dos fechas del mismo día de la semana duplicarían el pozo
+    wd_dates = defaultdict(set)
+    for d in ({p[1] for p in pairs} | {e["date"] for e in extra_hours or []} | {a["date"] for a in adjustments or []}):
+        wd_dates[d.weekday()].add(d)
+    repeated = [f"{DAYS[wd]} ({', '.join(fmt_date(x) for x in sorted(ds))})"
+                for wd, ds in sorted(wd_dates.items()) if len(ds) > 1]
+    if repeated:
+        raise ValueError(
+            "El archivo contiene más de una semana: " + "; ".join(repeated) + ". "
+            "Carga una sola semana (7 días) para no duplicar los pozos de propinas."
+        )
 
     def day_total(wd: int) -> float:
         return tips["unico"][wd] if modes[wd] else tips["dia"][wd] + tips["noche"][wd]
@@ -809,7 +1124,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
 
     warnings = []
 
-    # 1) y 2) Cada tramo completo (entrada, salida) se reparte según el modo de su día
+    # 1) y 2) Cada tramo completo se reparte según el modo de su día (las salidas pasadas de medianoche cuentan en el turno Noche)
     hours = defaultdict(float)  # (fecha, turno, nombre) -> horas
     for name, d, ent, sal in pairs:
         if area_of(name, d) == "Omitir":
@@ -822,7 +1137,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
             if sal - max(ent, cut_sec) > 0:
                 hours[(d, "Noche", name)] += (sal - max(ent, cut_sec)) / 3600
 
-    # 2a) Reemplazos / personal sin marcaje: horas cargadas a mano por día
+    # 2a) Reemplazos / personal sin marcaje
     for e in extra_hours or []:
         d, name = e["date"], e["name"]
         if area_of(name, d) == "Omitir":
@@ -830,9 +1145,9 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
         turno = "Único" if modes[d.weekday()] else (e["turno"] if e["turno"] in ("Día", "Noche") else "Día")
         hours[(d, turno, name)] += e["hours"]
 
-    # 2b) Ajustes manuales: se suman/restan a las horas de la persona ese día antes de repartir
-    adj_applied = defaultdict(float)  # nombre -> horas netas ajustadas
-    cocina_adj = defaultdict(float)   # (fecha, nombre) -> horas (cocina se calcula por día entero)
+    # 2b) Ajustes manuales
+    adj_applied = defaultdict(float)
+    cocina_adj = defaultdict(float)
     n_adj = 0
     for adj in adjustments or []:
         name, d, delta = adj["name"], adj["date"], adj["minutes"] / 60
@@ -859,14 +1174,14 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
 
     # 3) Horas por (fecha, turno, área) para atención y barra; horas por día para cocina
     area_hours = defaultdict(lambda: {"atencion": 0.0, "barra": 0.0})
-    cocina_day = defaultdict(float)  # (fecha, nombre) -> horas del día completo
+    cocina_day = defaultdict(float)
     for (d, turno, name), h in hours.items():
         area = area_of(name, d)
         if area == "cocina":
             cocina_day[(d, name)] += h
         else:
             area_hours[(d, turno)][area] += h
-    for key, delta in cocina_adj.items():  # ajustes de cocina, sobre el total del día
+    for key, delta in cocina_adj.items():
         new = cocina_day.get(key, 0.0) + delta
         if new > 1e-9:
             cocina_day[key] = new
@@ -874,13 +1189,12 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
             cocina_day.pop(key, None)
             if new < -1e-9:
                 warnings.append(f"Ajuste de {key[1]} ({DAYS[key[0].weekday()]} {fmt_date(key[0])}): restaba más horas de las trabajadas; quedó en 0.")
-    cocina_total = defaultdict(float)  # fecha -> horas totales de cocina
+    cocina_total = defaultdict(float)
     for (d, _name), h in cocina_day.items():
         cocina_total[d] += h
 
     # 4) Reparto proporcional
     rows = []
-    # 4a) Atención y barra: por turno (o por día entero si el día es Pozo Único)
     for (d, turno, name), h in hours.items():
         area = area_of(name, d)
         if area == "cocina":
@@ -888,11 +1202,26 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
         total_area = area_hours[(d, turno)][area]
         tip = (h / total_area) * (pool_of(d, turno) * pcts[area]) if total_area > 0 else 0.0
         rows.append({"date": d, "turno": turno, "name": name, "area": area, "hours": h, "tip": tip})
-    # 4b) Cocina: siempre por día entero sobre el pozo total del día
     for (d, name), h in cocina_day.items():
         pool = day_total(d.weekday()) * pcts["cocina"]
         tip = (h / cocina_total[d]) * pool if cocina_total[d] > 0 else 0.0
         rows.append({"date": d, "turno": "Día completo", "name": name, "area": "cocina", "hours": h, "tip": tip})
+
+    # 4c) Redondeo exacto (mayor residuo): cada grupo suma lo mismo que su pozo, en pesos enteros
+    groups = defaultdict(list)
+    for i, r in enumerate(rows):
+        groups[(r["date"], r["turno"], r["area"])].append(i)
+    for idxs in groups.values():
+        target = int(math.floor(sum(rows[i]["tip"] for i in idxs) + 0.5 + 1e-9))
+        floors = [int(math.floor(rows[i]["tip"] + 1e-9)) for i in idxs]
+        remainder = target - sum(floors)
+        order = sorted(range(len(idxs)),
+                       key=lambda k: (-(rows[idxs[k]]["tip"] - floors[k]), rows[idxs[k]]["name"].casefold()))
+        for k, i in enumerate(idxs):
+            rows[i]["tip"] = floors[k]
+        for k in order[:max(remainder, 0)]:
+            rows[idxs[k]]["tip"] += 1
+
     rows.sort(key=lambda r: (r["date"], TURNO_ORDER[r["turno"]], AREA_ORDER.index(r["area"]), r["name"].casefold()))
 
     # 5) Avisos por dinero sin repartir
@@ -921,25 +1250,15 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
             unassigned += total
             warnings.append(f"{DAYS[wd]}: ingresaste {money(total)} pero no hay horas registradas. Quedan sin repartir.")
 
-    dates_by_wd = defaultdict(set)
-    for d in dates_present:
-        dates_by_wd[d.weekday()].add(d)
-    for wd, ds in sorted(dates_by_wd.items()):
-        if len(ds) > 1:
-            warnings.append(
-                f"El archivo tiene {len(ds)} fechas distintas de {DAYS[wd]}. Se usa el mismo pozo para cada una; "
-                "carga una sola semana para evitar duplicar propinas."
-            )
-
-    # 6) Descuento Alfredo (asistencias de lunes a sábado) y resumen por colaborador
-    alfredo_dates = defaultdict(set)  # (nombre, área) -> fechas con asistencia
+    # 6) Descuento Alfredo y resumen por colaborador
+    alfredo_dates = defaultdict(set)
     for r in rows:
         if r["area"] in alfredo_rates and r["date"].weekday() in ALFREDO_WEEKDAYS:
             alfredo_dates[(r["name"], r["area"])].add(r["date"])
 
     people = {}
     for r in rows:
-        p = people.setdefault(r["name"], {"areas": set(), "hours": 0.0, "tip": 0.0})
+        p = people.setdefault(r["name"], {"areas": set(), "hours": 0.0, "tip": 0})
         p["areas"].add(r["area"])
         p["hours"] += r["hours"]
         p["tip"] += r["tip"]
@@ -949,7 +1268,7 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
     for name, p in people.items():
         days = sum(len(v) for (n, _a), v in alfredo_dates.items() if n == name)
         alfredo = sum(alfredo_rates[a] * len(v) for (n, a), v in alfredo_dates.items() if n == name)
-        tip = int(round(p["tip"]))
+        tip = int(p["tip"])
         areas_sorted = sorted(p["areas"], key=AREA_ORDER.index)
         summary.append({
             "name": name, "area": " / ".join(areas_sorted), "_order": AREA_ORDER.index(areas_sorted[0]),
@@ -1023,12 +1342,11 @@ WEEK_COLS = ["Día", "Área", "Horas Trabajadas", "Propina ($)", "Alfredo", "Net
 
 
 def person_week_dataframe(result: dict, name: str) -> pd.DataFrame:
-    """Detalle día por día de un colaborador: área, horas, propina y descuento Alfredo de cada fecha."""
     by_date = {}
     for r in result["rows"]:
         if r["name"] != name:
             continue
-        b = by_date.setdefault(r["date"], {"area": r["area"], "hours": 0.0, "tip": 0.0})
+        b = by_date.setdefault(r["date"], {"area": r["area"], "hours": 0.0, "tip": 0})
         b["hours"] += r["hours"]
         b["tip"] += r["tip"]
     out = []
@@ -1046,6 +1364,14 @@ def person_week_dataframe(result: dict, name: str) -> pd.DataFrame:
 
 def signed_hours(v) -> str:
     return "-" if not v else f"{v:+.2f}".replace(".", ",")
+
+
+def _neutralize_formulas(ws) -> None:
+    """Evita inyección de fórmulas: un texto que empieza con = + - @ se guarda como texto, no como fórmula."""
+    for row in ws.iter_rows():
+        for c in row:
+            if isinstance(c.value, str) and c.value[:1] in ("=", "+", "-", "@"):
+                c.data_type = "s"
 
 
 def to_excel_bytes(df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
@@ -1070,6 +1396,8 @@ def to_excel_bytes(df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
         pd.concat([df, total], ignore_index=True).to_excel(writer, index=False, sheet_name="Distribución")
         for col, width in zip("ABCDEF", [10, 20, 14, 26, 18, 14]):
             writer.sheets["Distribución"].column_dimensions[col].width = width
+        for ws in writer.sheets.values():
+            _neutralize_formulas(ws)
     return out.getvalue()
 
 
@@ -1077,7 +1405,6 @@ def to_excel_bytes(df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
 # ENVÍO DEL RESUMEN SEMANAL POR CORREO
 # ============================================================================
 def get_smtp_config():
-    """Lee [smtp] de st.secrets. Devuelve None si no está configurado (se simula el envío)."""
     cfg = _secrets_section("smtp")
     if not cfg:
         return None
@@ -1098,7 +1425,7 @@ def send_email(cfg: dict, to_addr: str, subject: str, body: str) -> None:
     msg = EmailMessage()
     msg["From"] = cfg["from_email"]
     msg["To"] = to_addr
-    msg["Subject"] = " ".join(subject.split())  # sin saltos de línea en el asunto
+    msg["Subject"] = " ".join(subject.split())
     msg.set_content(body)
     context = ssl.create_default_context()
     if cfg["use_ssl"]:
@@ -1141,16 +1468,27 @@ def render_email_panel(result: dict, srec: dict, wdf: pd.DataFrame):
     person = srec["name"]
     auth = st.session_state.get("auth") or {}
     signer = auth.get("name") if auth.get("role") == "sucursal" else "Administración"
+    registered = str(st.session_state.get("emails", {}).get(person, "") or "").strip()
+    cfg = get_smtp_config()
 
     st.markdown("**Enviar resumen por correo**")
-    to_addr = st.text_input("Correo del colaborador", value=st.session_state.get("emails", {}).get(person, ""),
-                            key=f"mail_to_{person}", placeholder="nombre@correo.cl").strip()
+    # La clave incluye el correo registrado: si cambia en la tabla de trabajadores, el campo se actualiza.
+    if cfg is not None:
+        if registered:
+            st.text_input("Correo del colaborador (cargado en la tabla de trabajadores)", value=registered,
+                          disabled=True, key=f"mail_to_{person}_{registered}")
+        else:
+            st.warning("Este colaborador no tiene correo. Agrégalo en la tabla de trabajadores para poder enviarle el resumen.")
+        to_addr = registered
+    else:
+        to_addr = st.text_input("Correo del colaborador", value=registered, key=f"mail_to_{person}_{registered}",
+                                placeholder="nombre@correo.cl").strip()
+
     subject = st.text_input("Asunto", value=f"Resumen semanal de propinas - {person}", key=f"mail_subject_{person}")
     default_body = build_email_body(result, srec, wdf, signer)
-    tag = hashlib.md5(default_body.encode("utf-8")).hexdigest()[:8]  # si cambian los datos, se regenera el texto
+    tag = hashlib.sha256(default_body.encode("utf-8")).hexdigest()[:8]
     body = st.text_area("Mensaje (editable)", value=default_body, height=320, key=f"mail_body_{person}_{tag}")
 
-    cfg = get_smtp_config()
     if cfg is None:
         st.info('El envío real no está configurado (falta la sección [smtp] en Secrets): el botón simula el envío.')
 
@@ -1167,19 +1505,21 @@ def render_email_panel(result: dict, srec: dict, wdf: pd.DataFrame):
                 st.caption("El mensaje es muy largo para abrirlo en el programa de correo.")
 
     if send:
-        sent = st.session_state.get("emails_sent", 0)
+        user_id = auth.get("username", "?")
         if not valid:
-            st.error("Escribe un correo válido.")
+            st.error("Escribe un correo válido." if cfg is None else "Este colaborador no tiene un correo válido cargado.")
         elif not subject.strip() or not body.strip():
             st.error("El asunto y el mensaje no pueden estar vacíos.")
-        elif sent >= MAX_EMAILS_PER_SESSION:
-            st.error(f"Alcanzaste el máximo de {MAX_EMAILS_PER_SESSION} correos por sesión.")
         elif cfg is None:
             st.success(f"Simulación: el correo para {to_addr} NO se envió realmente (SMTP no configurado).")
+        elif to_addr.lower() != registered.lower():
+            st.error("Solo se puede enviar al correo cargado en la tabla de trabajadores.")
+        elif not email_quota_ok(user_id):
+            st.error("Alcanzaste el límite de correos por hora. Intenta más tarde.")
         else:
             try:
                 send_email(cfg, to_addr, subject, body)
-                st.session_state["emails_sent"] = sent + 1
+                register_email(user_id)
                 st.success(f"Correo enviado a {to_addr}.")
             except (smtplib.SMTPException, OSError, ValueError) as e:
                 st.error(f"No se pudo enviar el correo: {e}")
@@ -1189,7 +1529,6 @@ def render_email_panel(result: dict, srec: dict, wdf: pd.DataFrame):
 # HERRAMIENTA: INTERFAZ
 # ============================================================================
 def describe_week(week: list) -> str:
-    """Resume la semana agrupando días consecutivos con la misma área."""
     parts, i = [], 0
     while i < 7:
         j = i
@@ -1201,7 +1540,6 @@ def describe_week(week: list) -> str:
 
 
 def expand_replacements(reps: list) -> list:
-    """Convierte cada reemplazo en filas (nombre, fecha, turno, horas) con las horas exactas de cada día."""
     out = []
     for rp in reps:
         for d, h in sorted(rp["hours_by_date"].items()):
@@ -1211,7 +1549,6 @@ def expand_replacements(reps: list) -> list:
 
 
 def file_dates(att: pd.DataFrame) -> list:
-    """Fechas del archivo, rellenando los días intermedios sin marcas (máx. 31 días)."""
     ds = sorted({to_date(x) for x in att["Fecha"]})
     if not ds:
         return []
@@ -1220,7 +1557,6 @@ def file_dates(att: pd.DataFrame) -> list:
 
 
 def add_replacement(taken: set):
-    """Callback del botón 'Agregar reemplazo'."""
     ss = st.session_state
     name = " ".join(str(ss.get("rep_name") or "").split())
     area = ss.get("rep_area")
@@ -1266,7 +1602,6 @@ def remove_replacement(i: int):
 
 
 def render_replacements(att, taken: set, cutoff):
-    """Registro de reemplazos y personal temporal que no aparece en el reloj de control."""
     st.caption(
         "Registra a quienes trabajaron sin marcar en el reloj: indica nombre, área, días trabajados y horas totales. "
         "Participan en el reparto de propinas y en el descuento Alfredo como cualquier colaborador. "
@@ -1329,7 +1664,6 @@ def fmt_pct(v: float) -> str:
 
 
 def save_my_pcts():
-    """Callback: guarda los porcentajes actuales como los de la sucursal que inició sesión."""
     ss = st.session_state
     auth = ss.get("auth") or {}
     vals = {a: float(ss.get(f"pct_{a}") or 0.0) for a, _ in PCT_AREAS}
@@ -1343,9 +1677,8 @@ def save_my_pcts():
 
 
 def render_pct_config(user: dict):
-    """Porcentajes de reparto por área. Devuelve (valores en %, suma en %)."""
     ss = st.session_state
-    if not ss.get("pct_ready"):  # primera vez en la sesión: carga lo guardado para la sucursal
+    if not ss.get("pct_ready"):
         saved = get_branch_pcts(user["username"]) if user["role"] == "sucursal" else dict(DEFAULT_PCTS)
         for a, _ in PCT_AREAS:
             ss[f"pct_{a}"] = float(saved[a])
@@ -1383,7 +1716,6 @@ def render_pct_config(user: dict):
 
 
 def save_my_alfredo():
-    """Callback: guarda los montos actuales de Alfredo como los de la sucursal que inició sesión."""
     ss = st.session_state
     auth = ss.get("auth") or {}
     if auth.get("role") != "sucursal":
@@ -1394,9 +1726,8 @@ def save_my_alfredo():
 
 
 def render_alfredo_config(user: dict) -> dict:
-    """Aporte del bachero (Alfredo) por día de asistencia. Devuelve {área: monto en $}."""
     ss = st.session_state
-    if not ss.get("alf_ready"):  # primera vez en la sesión: carga lo guardado para la sucursal
+    if not ss.get("alf_ready"):
         saved = get_branch_alfredo(user["username"]) if user["role"] == "sucursal" else dict(DEFAULT_ALFREDO)
         for a, _ in ALFREDO_AREAS:
             ss[f"alf_{a}"] = int(saved[a])
@@ -1429,7 +1760,6 @@ def fmt_minutes(mins: int) -> str:
 
 
 def add_adjustment(areas: dict, modes: list):
-    """Callback del botón 'Agregar ajuste' (se ejecuta antes de redibujar la página)."""
     ss = st.session_state
     name, d = ss.get("adj_name"), ss.get("adj_date")
     mins = int(ss.get("adj_h", 0)) * 60 + int(ss.get("adj_m", 0))
@@ -1466,7 +1796,6 @@ def remove_adjustment(i: int):
 
 
 def render_adjustments(areas: dict, modes: list, cutoff):
-    """Buscador rápido por colaborador para sumar o restar horas/minutos en un día concreto."""
     att = st.session_state["attendance"]
     names = sorted(areas, key=str.casefold)
     dates = sorted({to_date(x) for x in att["Fecha"]})
@@ -1525,358 +1854,374 @@ def render_adjustments(areas: dict, modes: list, cutoff):
 
 
 def reset_tool_state():
-    for k in ("file_sig", "attendance", "fixes", "adjustments", "replacements", "emails", "workers_df", "result", "result_sig",
-              "workers_editor", "fix_editor", "person_view"):
+    for k in ("file_sig", "file_info", "attendance", "fixes", "adjustments", "replacements", "emails", "workers_df",
+              "result", "result_sig", "workers_editor", "fix_editor", "person_view"):
         st.session_state.pop(k, None)
     for k in [k for k in st.session_state if str(k).startswith(("mixdays_", "adj_", "rep_", "mail_"))]:
         st.session_state.pop(k, None)
 
 
 def render_tool(user: dict):
-    st.title("Filtrado y Cálculo de Propinas")
-    if user["role"] == "sucursal":
-        st.caption(f"Sucursal: {user['name']}")
-
-    # ---- Sección 1
-    st.subheader("1. Cargar Tus Horas")
-    st.caption("El archivo debe tener las columnas Nombre, Fecha y Hora, con una fila por cada marca. Cada persona puede tener hasta 4 marcas por día (Entrada 1, Salida 1, Entrada 2, Salida 2).")
-    uploaded = st.file_uploader("Archivo Excel", type=["xlsx", "xls"], key="uploader")
-
-    if uploaded is None:
-        if "file_sig" in st.session_state:
-            reset_tool_state()
-    else:
-        sig = f"{uploaded.name}-{uploaded.size}"
-        if st.session_state.get("file_sig") != sig:
-            reset_tool_state()
-            try:
-                marks, empties, skipped, sheet = read_marks(uploaded.getvalue())
-                if not marks and not empties:
-                    raise ValueError("El archivo no tiene marcas válidas (revisa los formatos de Fecha y Hora).")
-                attendance = build_attendance(marks, empties)
-                names = sorted(attendance["Nombre"].unique(), key=str.casefold)
-                extras = []
-                if empties:
-                    extras.append(f"{len(empties)} con la hora vacía")
-                if skipped:
-                    extras.append(f"{skipped} ignoradas por nombre o fecha inválidos")
-                st.session_state.update(
-                    file_sig=sig,
-                    attendance=attendance,
-                    workers_df=pd.DataFrame({
-                        "Nombre": names,
-                        "Área Principal": ["atencion"] * len(names),
-                        "Área mixta": [False] * len(names),
-                        "Segunda Área": pd.Series([None] * len(names), dtype=object),
-                        "Correo": pd.Series([None] * len(names), dtype=object),
-                    }),
-                    file_info=f'{len(marks) + len(empties)} filas leídas de la hoja "{sheet}"'
-                    + (f" ({'; '.join(extras)})." if extras else "."),
-                )
-            except Exception as e:  # noqa: BLE001
-                st.error(f"No se pudo leer el archivo: {e}")
-        if "file_info" in st.session_state and "attendance" in st.session_state:
-            st.caption(st.session_state["file_info"])
-            render_missing_marks()
-
-    # ---- Sección 2
-    st.subheader("2. Configuración de Turnos y Mapeo")
-    all_single = all(st.session_state.get(f"single_{i}", False) for i in range(7))
-    cutoff = st.time_input("Hora de corte de turno", value=dtime(17, 30), key="cutoff",
-                           step=300, disabled=all_single,
-                           help="En los días en Modo Turnos: antes de esta hora es turno Día; desde esta hora, turno Noche.")
-
-    st.markdown("**Modo de cada día**")
-    st.caption(
-        "Desactivado = Modo Turnos (pozo de Día y pozo de Noche, según la hora de corte). "
-        "Activado = Modo Pozo Único (un solo pozo para todo el día, ideal para festivos)."
+    role_label = "ADMINISTRACIÓN" if user["role"] == "admin" else f"SUCURSAL · {user['name']}"
+    render_hero(
+        "CONTROL FINANCIERO · RESTAURANTES",
+        "Filtrado y cálculo de propinas",
+        "Importa asistencia, configura turnos y áreas, registra los pozos y revisa una distribución trazable.",
+        role_label,
     )
-    mode_cols = st.columns(4)
-    for i, day in enumerate(DAYS):
-        with mode_cols[i % 4]:
-            st.toggle(f"{day}: Pozo Único", value=False, key=f"single_{i}")
-    modes = [bool(st.session_state.get(f"single_{i}", False)) for i in range(7)]
 
-    pcts_vals, pcts_total = render_pct_config(user)
-    pcts_ok = pcts_total == 100.0
+    with st.container(border=True, key="upload-card"):
+        render_section_heading("01", "Cargar asistencia", "Importa el Excel semanal y revisa las marcas que necesitan corrección.")
+        st.caption("El archivo debe tener las columnas Nombre, Fecha y Hora, con una fila por cada marca. Cada persona puede tener hasta 4 marcas por día (Entrada 1, Salida 1, Entrada 2, Salida 2). Carga una sola semana.")
+        uploaded = st.file_uploader("Archivo Excel", type=["xlsx", "xls"], key="uploader")
 
-    alfredo_vals = render_alfredo_config(user)
+        if uploaded is None:
+            if "file_sig" in st.session_state:
+                reset_tool_state()
+        else:
+            uploaded_bytes = uploaded.getvalue()
+            sig = f"{uploaded.name}:{hashlib.sha256(uploaded_bytes).hexdigest()}"
+            if st.session_state.get("file_sig") != sig:
+                reset_tool_state()
+                try:
+                    marks, empties, skipped, sheet = read_marks(uploaded_bytes)
+                    if not marks and not empties:
+                        raise ValueError("El archivo no tiene marcas válidas (revisa los formatos de Fecha y Hora).")
+                    attendance = build_attendance(marks, empties)
+                    names = sorted(attendance["Nombre"].unique(), key=str.casefold)
+                    extras = []
+                    if empties:
+                        extras.append(f"{len(empties)} con la hora vacía")
+                    if skipped:
+                        extras.append(f"{skipped} ignoradas por nombre o fecha inválidos")
+                    st.session_state.update(
+                        file_sig=sig,
+                        attendance=attendance,
+                        workers_df=pd.DataFrame({
+                            "Nombre": names,
+                            "Área Principal": ["atencion"] * len(names),
+                            "Área mixta": [False] * len(names),
+                            "Segunda Área": pd.Series([None] * len(names), dtype=object),
+                            "Correo": pd.Series([None] * len(names), dtype=object),
+                        }),
+                        file_info=f'{len(marks) + len(empties)} filas leídas de la hoja "{sheet}"'
+                        + (f" ({'; '.join(extras)})." if extras else "."),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"No se pudo leer el archivo: {e}")
+            if "file_info" in st.session_state and "attendance" in st.session_state:
+                st.caption(st.session_state["file_info"])
+                render_missing_marks()
 
-    st.markdown("**Trabajadores encontrados**")
-    areas = {}          # nombre -> lista de 7 áreas (Lunes a Domingo)
-    emails = {}         # nombre -> correo (opcional)
-    mixed_errors = []   # personas con área mixta sin Segunda Área
-    if "workers_df" not in st.session_state:
-        st.info("Sube un archivo para ver aquí a los trabajadores y asignarles un área.")
-    else:
+    render_workflow_progress()
+
+    with st.container(border=True, key="setup-card"):
+        render_section_heading("02", "Configurar turnos y equipo", "Define el modo de cada día, el reparto por áreas y las excepciones de asistencia.")
+        all_single = all(st.session_state.get(f"single_{i}", False) for i in range(7))
+        cutoff = st.time_input("Hora de corte de turno", value=dtime(17, 30), key="cutoff",
+                               step=300, disabled=all_single,
+                               help="En los días en Modo Turnos: antes de esta hora es turno Día; desde esta hora, turno Noche.")
+
+        st.markdown("**Modo de cada día**")
         st.caption(
-            "Elige el Área Principal de cada persona. Si trabaja en dos áreas según el día, marca Área mixta, "
-            "elige su Segunda Área y luego indica abajo en qué días trabaja en ella."
+            "Desactivado = Modo Turnos (pozo de Día y pozo de Noche, según la hora de corte). "
+            "Activado = Modo Pozo Único (un solo pozo para todo el día, ideal para festivos)."
         )
-        edited = st.data_editor(
-            st.session_state["workers_df"],
-            key="workers_editor",
-            hide_index=True,
-            width="stretch",
-            disabled=["Nombre"],
-            column_config={
-                "Nombre": st.column_config.TextColumn("Nombre"),
-                "Área Principal": st.column_config.SelectboxColumn("Área Principal", options=AREAS, required=True),
-                "Área mixta": st.column_config.CheckboxColumn("Área mixta", help="Trabaja en dos áreas según el día de la semana."),
-                "Segunda Área": st.column_config.SelectboxColumn(
-                    "Segunda Área", options=AREAS, required=False, help="Solo se usa si Área mixta está marcada."),
-                "Correo": st.column_config.TextColumn("Correo", help="Opcional: para enviarle su resumen semanal."),
-            },
-        )
+        mode_cols = st.columns(4)
+        for i, day in enumerate(DAYS):
+            with mode_cols[i % 4]:
+                st.toggle(f"{day}: Pozo Único", value=False, key=f"single_{i}")
+        modes = [bool(st.session_state.get(f"single_{i}", False)) for i in range(7)]
 
-        # Streamlit descarta el valor de widgets que dejan de dibujarse (p. ej. al desmarcar Área mixta); lo conservamos.
-        for k in [k for k in st.session_state if str(k).startswith("mixdays_")]:
-            st.session_state[k] = st.session_state[k]
+        pcts_vals, pcts_total = render_pct_config(user)
+        pcts_ok = pcts_total == 100.0
 
-        records = edited.to_dict("records")
-        if any(bool(r["Área mixta"]) for r in records):
-            st.markdown("**Días de la Segunda Área**")
-            st.caption("Selecciona los días en que cada persona trabaja en su Segunda Área. Los demás días cuentan en su Área Principal.")
+        alfredo_vals = render_alfredo_config(user)
 
-        for r in records:
-            name, main = r["Nombre"], r["Área Principal"]
-            mail = r.get("Correo")
-            if not is_missing(mail) and str(mail).strip():
-                emails[name] = str(mail).strip()
-            if not bool(r["Área mixta"]):
-                areas[name] = [main] * 7
-                continue
-            second = r["Segunda Área"]
-            if is_missing(second):
-                mixed_errors.append(name)
-                second = main
-            second_days = st.multiselect(
-                f"{name}: días en Segunda Área ({'sin elegir' if name in mixed_errors else second}); resto: {main}",
-                DAYS,
-                key=f"mixdays_{name}",
+        st.markdown("**Trabajadores encontrados**")
+        areas = {}
+        emails = {}
+        mixed_errors = []
+        if "workers_df" not in st.session_state:
+            st.info("Sube un archivo para ver aquí a los trabajadores y asignarles un área.")
+        else:
+            st.caption(
+                "Elige el Área Principal de cada persona. Si trabaja en dos áreas según el día, marca Área mixta, "
+                "elige su Segunda Área y luego indica abajo en qué días trabaja en ella."
             )
-            areas[name] = [second if DAYS[i] in second_days else main for i in range(7)]
-            st.caption("Semana de " + name + " → " + describe_week(areas[name]))
-
-        if mixed_errors:
-            st.warning("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
-
-    # ---- Reemplazos / personal sin marcaje (opcional)
-    taken = {str(n).casefold() for n in areas}
-    with st.expander("Reemplazos y personal sin marcaje (opcional)",
-                     expanded=bool(st.session_state.get("replacements"))):
-        render_replacements(st.session_state.get("attendance"), taken, cutoff)
-    replacements = list(st.session_state.get("replacements", []))
-    for rp in replacements:
-        areas[rp["name"]] = [rp["area"]] * 7
-        if rp.get("email"):
-            emails[rp["name"]] = rp["email"]
-    extra_hours = expand_replacements(replacements)
-    st.session_state["emails"] = emails
-
-    zero_areas = [a for a, _ in PCT_AREAS if pcts_vals[a] == 0]
-    if zero_areas and areas:
-        affected = sorted({n for n, week in areas.items() if any(x in zero_areas for x in week)}, key=str.casefold)
-        if affected:
-            st.warning(
-                f"Hay personas en un área con 0% ({', '.join(zero_areas)}): no recibirán propina por ese tiempo. "
-                "Revisa su área o los porcentajes. Personas: " + ", ".join(affected) + "."
+            edited = st.data_editor(
+                st.session_state["workers_df"],
+                key="workers_editor",
+                hide_index=True,
+                width="stretch",
+                disabled=["Nombre"],
+                column_config={
+                    "Nombre": st.column_config.TextColumn("Nombre"),
+                    "Área Principal": st.column_config.SelectboxColumn("Área Principal", options=AREAS, required=True),
+                    "Área mixta": st.column_config.CheckboxColumn("Área mixta", help="Trabaja en dos áreas según el día de la semana."),
+                    "Segunda Área": st.column_config.SelectboxColumn(
+                        "Segunda Área", options=AREAS, required=False, help="Solo se usa si Área mixta está marcada."),
+                    "Correo": st.column_config.TextColumn("Correo", help="Opcional: para enviarle su resumen semanal."),
+                },
             )
 
-    # ---- Ajuste manual de horas (opcional)
-    if st.session_state.get("attendance") is not None and areas:
-        with st.expander("Ajuste manual de horas (excepciones y turnos extra)",
-                         expanded=bool(st.session_state.get("adjustments"))):
-            render_adjustments(areas, modes, cutoff)
-    adjustments = list(st.session_state.get("adjustments", []))
+            for k in [k for k in st.session_state if str(k).startswith("mixdays_")]:
+                st.session_state[k] = st.session_state[k]
 
-    # ---- Sección 3
-    st.subheader("3. Propinas Recaudadas ($)")
-    # Streamlit descarta el valor de widgets que dejan de dibujarse (al cambiar el modo de un día); lo conservamos.
-    for k in [f"tip_{m}_{i}" for m in "udn" for i in range(7)]:
-        if k in st.session_state:
-            st.session_state[k] = st.session_state[k]
+            records = edited.to_dict("records")
+            if any(bool(r["Área mixta"]) for r in records):
+                st.markdown("**Días de la Segunda Área**")
+                st.caption("Selecciona los días en que cada persona trabaja en su Segunda Área. Los demás días cuentan en su Área Principal.")
 
-    def tip_input(label, key):
-        return st.number_input(label, min_value=0, step=1000, value=0, format="%d", key=key)
-
-    st.caption("Cada día muestra los campos que corresponden a su modo. Abre un día para ingresar sus pozos.")
-    for i, day in enumerate(DAYS):
-        with st.expander(day, expanded=(i == 0)):
-            if modes[i]:
-                st.caption("Modo Pozo Único: un solo pozo para todo el día.")
-                tip_input("Pozo del día", f"tip_u_{i}")
-            else:
-                st.caption(f"Modo Turnos: Día antes de las {cutoff:%H:%M}; Noche desde esa hora.")
-                a, b = st.columns(2)
-                with a:
-                    tip_input("Turno Día", f"tip_d_{i}")
-                with b:
-                    tip_input("Turno Noche", f"tip_n_{i}")
-            if modes[i]:
-                day_sum = int(st.session_state.get(f"tip_u_{i}", 0))
-            else:
-                day_sum = int(st.session_state.get(f"tip_d_{i}", 0)) + int(st.session_state.get(f"tip_n_{i}", 0))
-            st.caption(f"Total del día: {money(day_sum)}")
-
-    tips = {
-        "unico": [int(st.session_state.get(f"tip_u_{i}", 0)) for i in range(7)],
-        "dia": [int(st.session_state.get(f"tip_d_{i}", 0)) for i in range(7)],
-        "noche": [int(st.session_state.get(f"tip_n_{i}", 0)) for i in range(7)],
-    }
-    week_total = sum(
-        tips["unico"][i] if modes[i] else tips["dia"][i] + tips["noche"][i] for i in range(7)
-    )
-    st.markdown(f"Total semana: **{money(week_total)}**")
-
-    # ---- Sección 4
-    st.subheader("4. Calcular Propinas")
-    st.caption(
-        f"Atención ({fmt_pct(pcts_vals['atencion'])}%) y barra ({fmt_pct(pcts_vals['barra'])}%) se reparten por turno "
-        "en los días en Modo Turnos, o por el día entero en Pozo Único. "
-        f"Cocina ({fmt_pct(pcts_vals['cocina'])}%) siempre se reparte por día entero, sobre el total recaudado ese día."
-    )
-
-    signature = json.dumps(
-        {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips, "p": pcts_vals, "q": alfredo_vals,
-         "j": [(a["name"], str(a["date"]), a["turno"], a["minutes"]) for a in adjustments],
-         "r": [(rp["name"], rp["area"], sorted((str(d), h) for d, h in rp["hours_by_date"].items()), rp["turno"])
-               for rp in replacements],
-         "x": sorted((str(k), v["s"], v["drop"]) for k, v in (st.session_state.get("fixes") or {}).items())},
-        sort_keys=True, ensure_ascii=False,
-    )
-
-    if st.button("Procesar y Ver Resultados", type="primary"):
-        try:
-            cut_sec = cutoff.hour * 3600 + cutoff.minute * 60 + cutoff.second
-            attendance = st.session_state.get("attendance")
-            if attendance is None:
-                raise ValueError("Primero sube el archivo Excel con las horas.")
-            fixes = st.session_state.get("fixes") or {}
-            final = apply_corrections(attendance, fixes)  # DataFrame principal + correcciones
-            pairs, pending = resolve_pairs(final)
-            if pending:
-                raise ValueError(
-                    f"Quedan {len(pending)} registros con marcas faltantes sin resolver. "
-                    "Complétalos en la tabla de registros con marcas faltantes (o márcalos como Descartar) y guarda las correcciones."
+            for r in records:
+                name, main = r["Nombre"], r["Área Principal"]
+                mail = r.get("Correo")
+                if not is_missing(mail) and str(mail).strip():
+                    emails[name] = str(mail).strip()
+                if not bool(r["Área mixta"]):
+                    areas[name] = [main] * 7
+                    continue
+                second = r["Segunda Área"]
+                if is_missing(second):
+                    mixed_errors.append(name)
+                    second = main
+                second_days = st.multiselect(
+                    f"{name}: días en Segunda Área ({'sin elegir' if name in mixed_errors else second}); resto: {main}",
+                    DAYS,
+                    key=f"mixdays_{name}",
                 )
-            if not pcts_ok:
-                raise ValueError(
-                    f"Los porcentajes de reparto suman {fmt_pct(pcts_total)}%: deben sumar exactamente 100% para calcular."
-                )
+                areas[name] = [second if DAYS[i] in second_days else main for i in range(7)]
+                st.caption("Semana de " + name + " → " + describe_week(areas[name]))
+
             if mixed_errors:
-                raise ValueError("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
-            pcts = {a: v / 100 for a, v in pcts_vals.items()}
-            result = compute(pairs, areas, modes, cut_sec, tips, pcts, alfredo_vals, adjustments, extra_hours)
-            incomplete_keys = [
-                (r["Nombre"], r["Fecha"])
-                for r in attendance[review_mask(attendance)].to_dict("records")
-            ]
-            n_drop = sum(1 for k in incomplete_keys if fixes.get(k, {}).get("drop"))
-            n_fix = sum(1 for k in incomplete_keys if k in fixes and not fixes[k]["drop"])
-            if n_fix or n_drop:
-                result["warnings"].insert(0, f"Se integraron {n_fix} días corregidos a mano y se descartaron {n_drop}.")
-            st.session_state["result"] = result
-            st.session_state["result_sig"] = signature
-        except ValueError as e:
-            st.session_state.pop("result", None)
-            st.error(str(e))
+                st.warning("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
 
-    # ---- Resultados
+        taken = {str(n).casefold() for n in areas}
+        with st.expander("Reemplazos y personal sin marcaje (opcional)",
+                         expanded=bool(st.session_state.get("replacements"))):
+            render_replacements(st.session_state.get("attendance"), taken, cutoff)
+        replacements = list(st.session_state.get("replacements", []))
+        for rp in replacements:
+            areas[rp["name"]] = [rp["area"]] * 7
+            if rp.get("email"):
+                emails[rp["name"]] = rp["email"]
+        extra_hours = expand_replacements(replacements)
+        st.session_state["emails"] = emails
+
+        zero_areas = [a for a, _ in PCT_AREAS if pcts_vals[a] == 0]
+        if zero_areas and areas:
+            affected = sorted({n for n, week in areas.items() if any(x in zero_areas for x in week)}, key=str.casefold)
+            if affected:
+                st.warning(
+                    f"Hay personas en un área con 0% ({', '.join(zero_areas)}): no recibirán propina por ese tiempo. "
+                    "Revisa su área o los porcentajes. Personas: " + ", ".join(affected) + "."
+                )
+
+        if st.session_state.get("attendance") is not None and areas:
+            with st.expander("Ajuste manual de horas (excepciones y turnos extra)",
+                             expanded=bool(st.session_state.get("adjustments"))):
+                render_adjustments(areas, modes, cutoff)
+        adjustments = list(st.session_state.get("adjustments", []))
+
+    with st.container(border=True, key="tips-card"):
+        render_section_heading("03", "Registrar propinas recaudadas", "Ingresa el total de cada pozo según el modo operativo de cada día.")
+        for k in [f"tip_{m}_{i}" for m in "udn" for i in range(7)]:
+            if k in st.session_state:
+                st.session_state[k] = st.session_state[k]
+
+        def tip_input(label, key):
+            return st.number_input(label, min_value=0, step=1000, value=0, format="%d", key=key)
+
+        st.caption("Cada día muestra los campos que corresponden a su modo. Abre un día para ingresar sus pozos.")
+        for i, day in enumerate(DAYS):
+            with st.expander(day, expanded=(i == 0)):
+                if modes[i]:
+                    st.caption("Modo Pozo Único: un solo pozo para todo el día.")
+                    tip_input("Pozo del día", f"tip_u_{i}")
+                else:
+                    st.caption(f"Modo Turnos: Día antes de las {cutoff:%H:%M}; Noche desde esa hora (incluye lo trabajado después de medianoche).")
+                    a, b = st.columns(2)
+                    with a:
+                        tip_input("Turno Día", f"tip_d_{i}")
+                    with b:
+                        tip_input("Turno Noche", f"tip_n_{i}")
+                if modes[i]:
+                    day_sum = int(st.session_state.get(f"tip_u_{i}", 0))
+                else:
+                    day_sum = int(st.session_state.get(f"tip_d_{i}", 0)) + int(st.session_state.get(f"tip_n_{i}", 0))
+                st.caption(f"Total del día: {money(day_sum)}")
+
+        tips = {
+            "unico": [int(st.session_state.get(f"tip_u_{i}", 0)) for i in range(7)],
+            "dia": [int(st.session_state.get(f"tip_d_{i}", 0)) for i in range(7)],
+            "noche": [int(st.session_state.get(f"tip_n_{i}", 0)) for i in range(7)],
+        }
+        week_total = sum(
+            tips["unico"][i] if modes[i] else tips["dia"][i] + tips["noche"][i] for i in range(7)
+        )
+        st.markdown(f"Total semana: **{money(week_total)}**")
+
+    with st.container(border=True, key="calculate-card"):
+        render_section_heading("04", "Calcular y revisar distribución", "El cálculo respeta las áreas, los turnos, los ajustes manuales y los aportes configurados.")
+        st.caption(
+            f"Atención ({fmt_pct(pcts_vals['atencion'])}%) y barra ({fmt_pct(pcts_vals['barra'])}%) se reparten por turno "
+            "en los días en Modo Turnos, o por el día entero en Pozo Único. "
+            f"Cocina ({fmt_pct(pcts_vals['cocina'])}%) siempre se reparte por día entero, sobre el total recaudado ese día."
+        )
+
+        signature = json.dumps(
+            {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips, "p": pcts_vals, "q": alfredo_vals,
+             "j": [(a["name"], str(a["date"]), a["turno"], a["minutes"]) for a in adjustments],
+             "r": [(rp["name"], rp["area"], sorted((str(d), h) for d, h in rp["hours_by_date"].items()), rp["turno"])
+                   for rp in replacements],
+             "x": sorted((str(k), v["s"], v["drop"]) for k, v in (st.session_state.get("fixes") or {}).items())},
+            sort_keys=True, ensure_ascii=False,
+        )
+
+        if st.button("Procesar y Ver Resultados", type="primary"):
+            try:
+                cut_sec = cutoff.hour * 3600 + cutoff.minute * 60 + cutoff.second
+                attendance = st.session_state.get("attendance")
+                if attendance is None:
+                    raise ValueError("Primero sube el archivo Excel con las horas.")
+                fixes = st.session_state.get("fixes") or {}
+                final = apply_corrections(attendance, fixes)
+                pairs, pending = resolve_pairs(final)
+                if pending:
+                    raise ValueError(
+                        f"Quedan {len(pending)} registros con marcas faltantes sin resolver. "
+                        "Complétalos en la tabla de registros con marcas faltantes (o márcalos como Descartar) y guarda las correcciones."
+                    )
+                if not pcts_ok:
+                    raise ValueError(
+                        f"Los porcentajes de reparto suman {fmt_pct(pcts_total)}%: deben sumar exactamente 100% para calcular."
+                    )
+                if mixed_errors:
+                    raise ValueError("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
+                pcts = {a: v / 100 for a, v in pcts_vals.items()}
+                result = compute(pairs, areas, modes, cut_sec, tips, pcts, alfredo_vals, adjustments, extra_hours)
+                incomplete_keys = [
+                    (r["Nombre"], r["Fecha"])
+                    for r in attendance[review_mask(attendance)].to_dict("records")
+                ]
+                n_drop = sum(1 for k in incomplete_keys if fixes.get(k, {}).get("drop"))
+                n_fix = sum(1 for k in incomplete_keys if k in fixes and not fixes[k]["drop"])
+                if n_fix or n_drop:
+                    result["warnings"].insert(0, f"Se integraron {n_fix} días corregidos a mano y se descartaron {n_drop}.")
+                st.session_state["result"] = result
+                st.session_state["result_sig"] = signature
+            except ValueError as e:
+                st.session_state.pop("result", None)
+                st.error(str(e))
+
     result = st.session_state.get("result")
     if result:
         render_results(result, stale=st.session_state.get("result_sig") != signature)
 
 
 def render_results(result: dict, stale: bool):
-    st.divider()
-    st.subheader("Resultados y Distribución")
+    with st.container(border=True, key="results-card"):
+        st.divider()
+        render_section_heading("✓", "Resultados y distribución", "Consulta los totales, revisa cada colaborador y exporta el detalle a Excel.")
 
-    if stale:
-        st.warning('Cambiaste datos después de calcular. Presiona "Procesar y Ver Resultados" para actualizar la tabla.')
-    for w in result["warnings"]:
-        st.warning(w)
+        if stale:
+            st.warning('Cambiaste datos después de calcular. Presiona "Procesar y Ver Resultados" para actualizar la tabla.')
+        for w in result["warnings"]:
+            st.warning(w)
 
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Total Propinas Recaudadas ($)", money(result["collected"]))
-    k2.metric("Total Horas Trabajadas", hours_fmt(result["total_hours"]))
-    k3.metric("Personal Procesado", result["people"])
-    if result["unassigned"] > 0:
-        st.caption(f"{money(result['distributed'])} repartidos; {money(result['unassigned'])} quedaron sin repartir.")
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Total Propinas Recaudadas ($)", money(result["collected"]))
+        k2.metric("Total Horas Trabajadas", hours_fmt(result["total_hours"]))
+        k3.metric("Personal Procesado", result["people"])
+        if result["unassigned"] > 0:
+            st.caption(f"{money(result['distributed'])} repartidos; {money(result['unassigned'])} quedaron sin repartir.")
 
-    df = results_dataframe(result)
-    sdf = summary_dataframe(result)
-    query = norm(st.text_input("Buscar por nombre, área, día o turno", key="search"))
-    view, sview = df, sdf
-    if query:
-        view = df[df.apply(lambda r: query in norm(" ".join(str(v) for v in r.values)), axis=1)]
-        sview = sdf[sdf.apply(lambda r: query in norm(f"{r['Nombre']} {r['Área']}"), axis=1)]
+        df = results_dataframe(result)
+        sdf = summary_dataframe(result)
+        query = norm(st.text_input("Buscar por nombre, área, día o turno", key="search"))
+        view, sview = df, sdf
+        if query:
+            view = df[df.apply(lambda r: query in norm(" ".join(str(v) for v in r.values)), axis=1)]
+            sview = sdf[sdf.apply(lambda r: query in norm(f"{r['Nombre']} {r['Área']}"), axis=1)]
 
-    st.markdown(f"**Resumen por colaborador** ({len(sview)} personas)")
-    st.caption(
-        "Alfredo: se descuentan " + " y ".join(
-            f"{money(result['alfredo_rates'][a])} en {a}" for a, _ in ALFREDO_AREAS) +
-        " por cada día de asistencia de lunes a sábado (atencion = garzón/garzona). "
-        "Total menos alfredo = Propina − Alfredo."
-    )
-    s_styled = sview.style.format({
-        "Horas Trabajadas": hours_fmt, "Ajuste manual (h)": signed_hours,
-        "Propina ($)": money, "Alfredo": money, "Total menos alfredo": money,
-    })
-    st.dataframe(s_styled, hide_index=True, width="stretch")
-    st.markdown(
-        f"**Total{' (filas filtradas)' if query else ''}:** propinas {money(sview['Propina ($)'].sum())}, "
-        f"Alfredo {money(sview['Alfredo'].sum())}, total menos alfredo {money(sview['Total menos alfredo'].sum())}"
-    )
-
-    # ---- Resumen semanal individual
-    st.markdown("**Resumen semanal por colaborador**")
-    names = [x["name"] for x in result["summary"]]
-    if st.session_state.get("person_view") not in names:
-        st.session_state.pop("person_view", None)
-    person = st.selectbox("Colaborador (escribe para buscar)", names, index=None,
-                          placeholder="Elige un colaborador para ver su semana…", key="person_view")
-    if person:
-        srec = next(x for x in result["summary"] if x["name"] == person)
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Horas trabajadas", hours_fmt(srec["hours"]))
-        m2.metric("Propina ($)", money(srec["tip"]))
-        m3.metric("Alfredo", money(srec["alfredo"]))
-        m4.metric("Total menos alfredo", money(srec["total"]))
-        extra = f"Área: {srec['area']}. Asistencias de lunes a sábado: {srec['alfredo_days']}."
-        if srec["adj_hours"]:
-            extra += f" Ajuste manual incluido en las horas: {signed_hours(srec['adj_hours'])} h."
-        if srec.get("replacement"):
-            extra += " Reemplazo sin marcaje (horas cargadas a mano)."
-        st.caption(extra)
-        wdf = person_week_dataframe(result, person)
-        st.dataframe(
-            wdf.style.format({"Horas Trabajadas": hours_fmt, "Propina ($)": money, "Alfredo": money, "Neto del día ($)": money}),
-            hide_index=True, width="stretch",
+        st.markdown(f"**Resumen por colaborador** ({len(sview)} personas)")
+        st.caption(
+            "Alfredo: se descuentan " + " y ".join(
+                f"{money(result['alfredo_rates'][a])} en {a}" for a, _ in ALFREDO_AREAS) +
+            " por cada día de asistencia de lunes a sábado (atencion = garzón/garzona). "
+            "Total menos alfredo = Propina − Alfredo."
         )
-        render_email_panel(result, srec, wdf)
+        s_styled = sview.style.format({
+            "Horas Trabajadas": hours_fmt, "Ajuste manual (h)": signed_hours,
+            "Propina ($)": money, "Alfredo": money, "Total menos alfredo": money,
+        })
+        st.dataframe(s_styled, hide_index=True, width="stretch")
+        st.markdown(
+            f"**Total{' (filas filtradas)' if query else ''}:** propinas {money(sview['Propina ($)'].sum())}, "
+            f"Alfredo {money(sview['Alfredo'].sum())}, total menos alfredo {money(sview['Total menos alfredo'].sum())}"
+        )
 
-    st.markdown(f"**Detalle por día y turno** ({len(view)} filas)")
-    styled = view.style.format({"Horas Trabajadas": hours_fmt, "Propina ($)": money})
-    st.dataframe(styled, hide_index=True, width="stretch")
-    st.markdown(
-        f"**Total{' (filas filtradas)' if query else ''}:** {hours_fmt(view['Horas Trabajadas'].sum())} horas, "
-        f"{money(view['Propina ($)'].sum())}"
-    )
+        st.markdown("**Resumen semanal por colaborador**")
+        names = [x["name"] for x in result["summary"]]
+        if st.session_state.get("person_view") not in names:
+            st.session_state.pop("person_view", None)
+        person = st.selectbox("Colaborador (escribe para buscar)", names, index=None,
+                              placeholder="Elige un colaborador para ver su semana…", key="person_view")
+        if person:
+            srec = next(x for x in result["summary"] if x["name"] == person)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Horas trabajadas", hours_fmt(srec["hours"]))
+            m2.metric("Propina ($)", money(srec["tip"]))
+            m3.metric("Alfredo", money(srec["alfredo"]))
+            m4.metric("Total menos alfredo", money(srec["total"]))
+            extra = f"Área: {srec['area']}. Asistencias de lunes a sábado: {srec['alfredo_days']}."
+            if srec["adj_hours"]:
+                extra += f" Ajuste manual incluido en las horas: {signed_hours(srec['adj_hours'])} h."
+            if srec.get("replacement"):
+                extra += " Reemplazo sin marcaje (horas cargadas a mano)."
+            st.caption(extra)
+            wdf = person_week_dataframe(result, person)
+            st.dataframe(
+                wdf.style.format({"Horas Trabajadas": hours_fmt, "Propina ($)": money, "Alfredo": money, "Neto del día ($)": money}),
+                hide_index=True, width="stretch",
+            )
+            render_email_panel(result, srec, wdf)
 
-    st.download_button(
-        "Descargar copia en Excel (.xlsx)",
-        data=to_excel_bytes(df, sdf),
-        file_name="distribucion_propinas.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        st.markdown(f"**Detalle por día y turno** ({len(view)} filas)")
+        styled = view.style.format({"Horas Trabajadas": hours_fmt, "Propina ($)": money})
+        st.dataframe(styled, hide_index=True, width="stretch")
+        st.markdown(
+            f"**Total{' (filas filtradas)' if query else ''}:** {hours_fmt(view['Horas Trabajadas'].sum())} horas, "
+            f"{money(view['Propina ($)'].sum())}"
+        )
+
+        st.download_button(
+            "Descargar copia en Excel (.xlsx)",
+            data=to_excel_bytes(df, sdf),
+            file_name="distribucion_propinas.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 
 # ============================================================================
 # PANEL DE CONTROL DE ACCESO (SOLO ADMIN)
 # ============================================================================
 def render_admin_panel():
-    st.title("Panel de Control de Acceso")
+    users = load_users()
+    render_hero(
+        "ADMINISTRACIÓN · ACCESOS",
+        "Panel de control de acceso",
+        "Gestiona sucursales, permisos, credenciales y parámetros de reparto desde un solo lugar.",
+        "SOLO ADMINISTRACIÓN",
+    )
+    active_count = sum(1 for rec in users.values() if rec.get("active"))
+    total_count = len(users)
+    inactive_count = total_count - active_count
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("Sucursales registradas", total_count)
+    metric_cols[1].metric("Accesos activos", active_count)
+    metric_cols[2].metric("Accesos desactivados", inactive_count)
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
     flash = st.session_state.pop("flash", None)
     if flash:
@@ -1888,8 +2233,7 @@ def render_admin_panel():
         '"Generar configuración para st.secrets" al final de esta página.'
     )
 
-    # ---- Crear sucursal
-    st.subheader("Crear nueva sucursal")
+    render_section_heading("01", "Crear una sucursal", "Cada sucursal obtiene un usuario propio y parámetros iniciales de seguridad.")
     with st.form("create_branch", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         new_user = c1.text_input("Usuario", help="Minúsculas, números, guion o guion bajo (3 a 32 caracteres).")
@@ -1903,9 +2247,7 @@ def render_admin_panel():
                 st.session_state["flash"] = f'Sucursal "{new_name.strip()}" creada.'
                 st.rerun()
 
-    # ---- Tabla de sucursales
-    st.subheader("Sucursales registradas")
-    users = load_users()
+    render_section_heading("02", "Sucursales registradas", "Estado de acceso y origen de la configuración de cada cuenta.")
     if not users:
         st.info("Todavía no hay sucursales. Crea la primera con el formulario de arriba.")
     else:
@@ -1917,8 +2259,7 @@ def render_admin_panel():
         )
         st.dataframe(table, hide_index=True, width="stretch")
 
-        # ---- Acciones
-        st.subheader("Gestionar una sucursal")
+        render_section_heading("03", "Gestionar una sucursal", "Actualiza credenciales, estado de acceso y reglas de reparto.")
         selected = st.selectbox(
             "Sucursal", options=sorted(users), format_func=lambda u: f"{users[u]['name']} ({u})", key="manage_select"
         )
@@ -1954,7 +2295,6 @@ def render_admin_panel():
                             st.session_state["flash"] = f'Contraseña de "{rec["name"]}" actualizada.'
                             st.rerun()
 
-        # ---- Porcentajes de reparto de la sucursal
         st.markdown("**Porcentajes de reparto de la sucursal**")
         cur = branch_pcts(rec)
         with st.form(f"pct_form_{selected}"):
@@ -1976,7 +2316,6 @@ def render_admin_panel():
                         st.session_state["flash"] = f'Porcentajes de "{rec["name"]}" guardados.'
                         st.rerun()
 
-        # ---- Aporte del bachero (Alfredo) de la sucursal
         st.markdown("**Aporte del bachero (Alfredo) de la sucursal**")
         cur_alf = branch_alfredo(rec)
         with st.form(f"alf_form_{selected}"):
@@ -1994,8 +2333,7 @@ def render_admin_panel():
                     st.session_state["flash"] = f'Montos de Alfredo de "{rec["name"]}" guardados.'
                     st.rerun()
 
-        # ---- Exportar para secrets
-        st.subheader("Hacer los cambios permanentes")
+        render_section_heading("04", "Hacer los cambios permanentes", "Exporta la configuración cifrada para guardarla en los Secrets de Streamlit.")
         st.caption("Genera el bloque de configuración (con contraseñas ya cifradas) y pégalo en Settings > Secrets de tu app.")
         if st.button("Generar configuración para st.secrets"):
             toml = build_secrets_toml(users)
@@ -2013,18 +2351,27 @@ def main():
         return
 
     with st.sidebar:
-        st.markdown(f"**{user['name']}**")
-        st.caption("Administrador" if user["role"] == "admin" else "Sucursal")
+        st.markdown(
+            '<div class="brand-lockup"><div class="brand-mark">✦</div>'
+            '<div><div class="brand-name">Propinas</div>'
+            '<div class="brand-sub">Gestión semanal</div></div></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div class='eyebrow' style='margin-bottom:8px'>SESIÓN ACTIVA</div>", unsafe_allow_html=True)
+        st.markdown(f"**{html.escape(user['name'])}**")
+        st.caption("Administrador" if user["role"] == "admin" else "Cuenta de sucursal")
+        st.divider()
         page = "Cálculo de Propinas"
         if user["role"] == "admin":
             page = st.radio("Menú", ["Cálculo de Propinas", "Panel de Control de Acceso"], key="page")
         if st.button("Cerrar sesión"):
             logout()
 
-    if page == "Panel de Control de Acceso" and user["role"] == "admin":  # doble verificación de rol
+    if page == "Panel de Control de Acceso" and user["role"] == "admin":
         render_admin_panel()
     else:
         render_tool(user)
 
 
-main()
+if __name__ == "__main__":
+    main()
