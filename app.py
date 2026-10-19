@@ -50,6 +50,29 @@ Para enviar de verdad, agrega en Secrets:
 Con SMTP configurado, solo se puede enviar al correo cargado en la tabla de trabajadores
 (no a direcciones libres) y hay un límite de envíos por hora.
 
+Almacenamiento permanente (recomendado): Supabase
+-------------------------------------------------
+Sin esto, usuarios, porcentajes, montos de Alfredo y correos se guardan en un archivo que
+Streamlit Cloud borra al reiniciar. Con Supabase quedan guardados por sucursal.
+
+1) En Supabase > SQL Editor ejecuta:
+
+    create table if not exists propinas_users (
+      username text primary key,
+      data jsonb not null default '{}'::jsonb
+    );
+    alter table propinas_users enable row level security;   -- sin políticas: solo entra la clave de servicio
+
+2) En Settings > Secrets agrega (usa la clave "service_role", es SECRETA: nunca la subas a GitHub):
+
+    [supabase]
+    url   = "https://TU-PROYECTO.supabase.co"
+    key   = "clave-service-role"
+    table = "propinas_users"      # opcional
+
+Cada sucursal guarda su propio registro: contraseña (hash), estado, porcentajes, montos de Alfredo
+y correos de sus colaboradores. Nada se comparte entre sucursales.
+
 Cómo se guardan los accesos
 ---------------------------
 * st.secrets es de SOLO LECTURA mientras la app corre. El administrador y las sucursales
@@ -68,6 +91,7 @@ turno del día de entrada.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import html
 import hmac
@@ -82,6 +106,8 @@ import ssl
 import threading
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from datetime import date, datetime, time as dtime, timedelta
 from email.message import EmailMessage
@@ -219,6 +245,12 @@ REPLACEMENT_AREAS = ["atencion", "barra", "cocina"]
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MAX_EMAILS_PER_USER_HOUR = 20
 MAX_EMAILS_GLOBAL_HOUR = 60
+
+MAX_SAVED_EMAILS = 500
+MAX_EMAIL_LEN = 120
+TABLE_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+REMOTE_TIMEOUT = 8
+REMOTE_CACHE_TTL = 5
 
 DAY_SECONDS = 86400
 EARLY_CUTOFF = 5 * 3600  # marcas antes de las 05:00 pueden ser la salida de un turno de la noche anterior
@@ -529,7 +561,7 @@ def _secret_users() -> dict:
     return users
 
 
-def _read_overlay() -> dict:
+def _read_file_overlay() -> dict:
     try:
         with open(DB_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -538,11 +570,117 @@ def _read_overlay() -> dict:
         return {}
 
 
-def _write_overlay(data: dict) -> None:
+def _write_file_overlay(data: dict) -> None:
     tmp = DB_PATH.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, DB_PATH)
+
+
+def _remote_cfg():
+    """[supabase] en Secrets (url, key, table). Si falta, se usa el archivo JSON (temporal en Streamlit Cloud)."""
+    cfg = _secrets_section("supabase")
+    if not cfg:
+        return None
+    cfg = dict(cfg)
+    url = str(cfg.get("url", "")).strip().rstrip("/")
+    key = str(cfg.get("key", "")).strip()
+    table = str(cfg.get("table", "propinas_users")).strip()
+    local = url.startswith(("http://127.0.0.1", "http://localhost"))
+    if not url or not key or not TABLE_RE.match(table) or not (url.startswith("https://") or local):
+        return None
+    return {"url": url, "key": key, "table": table}
+
+
+def storage_mode() -> str:
+    return "supabase" if _remote_cfg() else "archivo"
+
+
+@st.cache_resource
+def _db_cache() -> dict:
+    return {"lock": threading.Lock(), "data": None, "ts": 0.0, "error": None}
+
+
+def _remote_request(cfg: dict, method: str, query: str = "", body=None, prefer: str | None = None):
+    headers = {"apikey": cfg["key"], "Authorization": f"Bearer {cfg['key']}", "Accept": "application/json"}
+    data = None
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if prefer:
+        headers["Prefer"] = prefer
+    req = urllib.request.Request(f"{cfg['url']}/rest/v1/{cfg['table']}{query}", data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=REMOTE_TIMEOUT) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        raise OSError(f"La base de datos respondió con el código {e.code}") from e
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError as e:
+        raise OSError("Respuesta inválida de la base de datos") from e
+
+
+def _read_overlay() -> dict:
+    """Datos por sucursal (clave = usuario). Lee de Supabase (con caché de unos segundos) o del archivo JSON."""
+    cfg = _remote_cfg()
+    if cfg is None:
+        return _read_file_overlay()
+    cache, now = _db_cache(), time.time()
+    with cache["lock"]:
+        if cache["data"] is not None and now - cache["ts"] < REMOTE_CACHE_TTL:
+            return copy.deepcopy(cache["data"])
+    try:
+        rows = _remote_request(cfg, "GET", "?select=username,data") or []
+        data = {str(r["username"]).lower(): r["data"] for r in rows if isinstance(r.get("data"), dict)}
+        error = None
+    except (OSError, KeyError, TypeError, AttributeError) as e:
+        error = str(e)
+        with cache["lock"]:
+            data = cache["data"]
+        if data is None:  # sin lectura previa: lo único disponible es el archivo local
+            data = _read_file_overlay()
+    with cache["lock"]:
+        cache["data"], cache["ts"], cache["error"] = data, now, error
+    return copy.deepcopy(data)
+
+
+def storage_error() -> str | None:
+    return _db_cache()["error"] if _remote_cfg() else None
+
+
+def _update_overlay(uname: str, fields: dict | None = None, fn=None) -> None:
+    """Actualiza SOLO el registro de una sucursal. fn(registro_actual) -> campos a cambiar (evita pisar cambios)."""
+    with _DB_LOCK:
+        cfg = _remote_cfg()
+        if cfg is None:
+            data = _read_file_overlay()
+            rec = data.setdefault(uname, {})
+            rec.update(fn(rec) if fn else fields)
+            _write_file_overlay(data)
+            return
+        rows = _remote_request(cfg, "GET", f"?username=eq.{quote(uname, safe='')}&select=data") or []
+        rec = dict(rows[0]["data"]) if rows and isinstance(rows[0].get("data"), dict) else {}
+        rec.update(fn(rec) if fn else fields)
+        _remote_request(cfg, "POST", "?on_conflict=username", [{"username": uname, "data": rec}],
+                        prefer="resolution=merge-duplicates,return=minimal")
+        cache = _db_cache()
+        with cache["lock"]:
+            cache["ts"] = 0.0  # fuerza releer en la próxima consulta
+
+
+def remote_health() -> str | None:
+    """None si la conexión funciona; si no, el mensaje de error."""
+    cfg = _remote_cfg()
+    if cfg is None:
+        return "Supabase no está configurado."
+    try:
+        _remote_request(cfg, "GET", "?select=username&limit=1")
+        return None
+    except OSError as e:
+        return str(e)
 
 
 def load_users() -> dict:
@@ -566,13 +704,6 @@ def load_users() -> dict:
         else:
             rec["source"] = "panel"
     return users
-
-
-def _update_overlay(uname: str, fields: dict) -> None:
-    with _DB_LOCK:
-        data = _read_overlay()
-        data.setdefault(uname, {}).update(fields)
-        _write_overlay(data)
 
 
 def create_branch(username: str, name: str, password: str) -> str | None:
@@ -617,6 +748,48 @@ def set_alfredo(uname: str, rates: dict) -> str | None:
         return "Los montos deben ser números entre 0 y 100.000."
     try:
         _update_overlay(uname, {"alfredo": {a: int(float(rates[a])) for a, _ in ALFREDO_AREAS}})
+    except OSError as e:
+        return f"No se pudo guardar: {e}"
+    return None
+
+
+def email_key(name) -> str:
+    return norm(name)
+
+
+def get_branch_emails(owner: str) -> dict:
+    """{nombre normalizado: correo} guardados para esa sucursal (nunca mezcla con otros locales)."""
+    raw = (_read_overlay().get(owner) or {}).get("emails")
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(v, dict) and EMAIL_RE.match(str(v.get("email", ""))):
+                out[str(k)] = str(v["email"])
+    return out
+
+
+def set_branch_emails(owner: str, entries: dict, remove) -> str | None:
+    """Guarda/actualiza correos (entries = {nombre: correo}) y borra los de `remove` (lista de nombres)."""
+    if owner not in load_users():
+        return "La sucursal no existe."
+    for name, mail in entries.items():
+        if not EMAIL_RE.match(mail) or len(mail) > MAX_EMAIL_LEN:
+            return f"El correo de {name} no es válido."
+
+    def change(rec: dict) -> dict:
+        current = dict(rec.get("emails") or {})
+        for name in remove:
+            current.pop(email_key(name), None)
+        for name, mail in entries.items():
+            current[email_key(name)] = {"name": name[:80], "email": mail}
+        if len(current) > MAX_SAVED_EMAILS:
+            raise ValueError(f"Máximo {MAX_SAVED_EMAILS} correos guardados por sucursal.")
+        return {"emails": current}
+
+    try:
+        _update_overlay(owner, fn=change)
+    except ValueError as e:
+        return str(e)
     except OSError as e:
         return f"No se pudo guardar: {e}"
     return None
@@ -1699,26 +1872,36 @@ def fmt_pct(v: float) -> str:
     return f"{v:.2f}".rstrip("0").rstrip(".").replace(".", ",")
 
 
+def config_owner(user: dict) -> str:
+    """Sucursal cuya configuración se usa: la propia (sucursal) o la elegida por el administrador."""
+    if user["role"] == "sucursal":
+        return user["username"]
+    return st.session_state.get("cfg_branch") or ""
+
+
 def save_my_pcts():
     ss = st.session_state
     auth = ss.get("auth") or {}
     vals = {a: float(ss.get(f"pct_{a}") or 0.0) for a, _ in PCT_AREAS}
-    if auth.get("role") != "sucursal":
+    owner = config_owner(auth) if auth else ""
+    if not owner:
         return
     if round(sum(vals.values()), 6) != 100.0:
         ss["pct_msg"] = ("error", "Los porcentajes deben sumar exactamente 100% para guardarlos.")
         return
-    err = set_pcts(auth["username"], vals)
+    err = set_pcts(owner, vals)
     ss["pct_msg"] = ("error", err) if err else ("ok", "Porcentajes guardados como los de tu sucursal.")
 
 
 def render_pct_config(user: dict):
     ss = st.session_state
-    if not ss.get("pct_ready"):
-        saved = get_branch_pcts(user["username"]) if user["role"] == "sucursal" else dict(DEFAULT_PCTS)
+    owner = config_owner(user)
+    saved = get_branch_pcts(owner) if owner else dict(DEFAULT_PCTS)
+    stamp = (owner, tuple(sorted(saved.items())))
+    if ss.get("pct_stamp") != stamp:  # cambió la sucursal o su configuración guardada: se vuelve a cargar
         for a, _ in PCT_AREAS:
             ss[f"pct_{a}"] = float(saved[a])
-        ss["pct_ready"] = True
+        ss["pct_stamp"] = stamp
 
     st.markdown("**Porcentajes de reparto por área**")
     st.caption(
@@ -1741,10 +1924,11 @@ def render_pct_config(user: dict):
             "Deben sumar exactamente 100%: el cálculo queda bloqueado hasta corregirlo."
         )
 
-    if user["role"] == "sucursal":
-        st.button("Guardar como porcentajes de mi sucursal", on_click=save_my_pcts, disabled=(total != 100.0))
+    if owner:
+        st.button("Guardar como porcentajes de mi sucursal" if user["role"] == "sucursal" else "Guardar como porcentajes de la sucursal elegida",
+                  on_click=save_my_pcts, disabled=(total != 100.0))
     else:
-        st.caption("Estos porcentajes valen solo para esta sesión. Para fijarlos por sucursal usa el Panel de Control de Acceso.")
+        st.caption("Estos porcentajes valen solo para esta sesión. Elige una sucursal arriba o usa el Panel de Control de Acceso para fijarlos.")
     msg = ss.pop("pct_msg", None)
     if msg:
         (st.success if msg[0] == "ok" else st.error)(msg[1])
@@ -1754,20 +1938,23 @@ def render_pct_config(user: dict):
 def save_my_alfredo():
     ss = st.session_state
     auth = ss.get("auth") or {}
-    if auth.get("role") != "sucursal":
+    owner = config_owner(auth) if auth else ""
+    if not owner:
         return
     vals = {a: int(ss.get(f"alf_{a}") or 0) for a, _ in ALFREDO_AREAS}
-    err = set_alfredo(auth["username"], vals)
+    err = set_alfredo(owner, vals)
     ss["alf_msg"] = ("error", err) if err else ("ok", "Montos guardados como los de tu sucursal.")
 
 
 def render_alfredo_config(user: dict) -> dict:
     ss = st.session_state
-    if not ss.get("alf_ready"):
-        saved = get_branch_alfredo(user["username"]) if user["role"] == "sucursal" else dict(DEFAULT_ALFREDO)
+    owner = config_owner(user)
+    saved = get_branch_alfredo(owner) if owner else dict(DEFAULT_ALFREDO)
+    stamp = (owner, tuple(sorted(saved.items())))
+    if ss.get("alf_stamp") != stamp:
         for a, _ in ALFREDO_AREAS:
             ss[f"alf_{a}"] = int(saved[a])
-        ss["alf_ready"] = True
+        ss["alf_stamp"] = stamp
 
     with st.expander("Aporte del bachero (Alfredo)"):
         st.caption(
@@ -1780,10 +1967,11 @@ def render_alfredo_config(user: dict) -> dict:
             with col:
                 st.number_input(f"{label}: aporte por asistencia ($)", min_value=0, max_value=100000,
                                 step=100, key=f"alf_{a}")
-        if user["role"] == "sucursal":
-            st.button("Guardar como montos de mi sucursal", on_click=save_my_alfredo)
+        if owner:
+            st.button("Guardar como montos de mi sucursal" if user["role"] == "sucursal" else "Guardar como montos de la sucursal elegida",
+                      on_click=save_my_alfredo)
         else:
-            st.caption("Estos montos valen solo para esta sesión. Para fijarlos por sucursal usa el Panel de Control de Acceso.")
+            st.caption("Estos montos valen solo para esta sesión. Elige una sucursal arriba o usa el Panel de Control de Acceso para fijarlos.")
         msg = ss.pop("alf_msg", None)
         if msg:
             (st.success if msg[0] == "ok" else st.error)(msg[1])
@@ -1889,8 +2077,63 @@ def render_adjustments(areas: dict, modes: list, cutoff):
             col_b.button("Quitar", key=f"adj_del_{i}", on_click=remove_adjustment, args=(i,))
 
 
+def prefill_saved_emails(owner: str):
+    """Rellena la columna Correo con los correos guardados de la sucursal (al subir el archivo o al cambiar de sucursal)."""
+    ss = st.session_state
+    df = ss.get("workers_df")
+    if df is None or ss.get("workers_owner", "__sin_cargar__") == owner:
+        return
+    saved = get_branch_emails(owner) if owner else {}
+    df = df.copy()
+    df["Correo"] = pd.Series([saved.get(email_key(n), "") for n in df["Nombre"]], dtype=object)
+    ss["workers_df"] = df
+    ss["workers_owner"] = owner
+    ss.pop("workers_editor", None)  # el editor se vuelve a crear con los correos cargados
+
+
+def render_save_emails(owner: str, edited: pd.DataFrame):
+    """Botón para guardar de forma permanente los correos de la tabla en la sucursal activa."""
+    n_saved = len(get_branch_emails(owner)) if owner else 0
+    if not owner:
+        st.caption("Los correos de esta tabla valen solo para esta sesión. Elige una sucursal arriba para guardarlos.")
+        return
+    if storage_mode() == "archivo":
+        st.warning(
+            "Almacenamiento temporal: los correos se guardan en un archivo que Streamlit Cloud borra al reiniciar la app. "
+            "Para que sean permanentes configura [supabase] en Secrets (ver instrucciones al inicio del código)."
+        )
+    err_storage = storage_error()
+    if err_storage:
+        st.error(f"No se pudo leer la base de datos ({err_storage}). Se muestran los últimos datos conocidos.")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        clicked = st.button("Guardar correos de la sucursal", key="save_emails_btn")
+    with c2:
+        st.caption(f"Correos guardados en esta sucursal: {n_saved}. Se cargan solos cada semana; "
+                   "si dejas vacío el correo de alguien y guardas, se borra el suyo.")
+    if clicked:
+        entries, remove, bad = {}, [], []
+        for r in edited.to_dict("records"):
+            name = r["Nombre"]
+            mail = "" if is_missing(r.get("Correo")) else str(r["Correo"]).strip()
+            if not mail:
+                remove.append(name)
+            elif EMAIL_RE.match(mail) and len(mail) <= MAX_EMAIL_LEN:
+                entries[name] = mail
+            else:
+                bad.append(f"{name} ({mail})")
+        if bad:
+            st.error("Estos correos no son válidos; no se guardó nada: " + "; ".join(bad[:10]))
+        else:
+            err = set_branch_emails(owner, entries, remove)
+            if err:
+                st.error(err)
+            else:
+                st.success(f"Correos guardados: {len(entries)}" + (f" ({len(remove)} sin correo)." if remove else "."))
+
+
 def reset_tool_state():
-    for k in ("file_sig", "file_info", "attendance", "fixes", "adjustments", "replacements", "emails", "workers_df",
+    for k in ("file_sig", "file_info", "attendance", "fixes", "adjustments", "replacements", "emails", "workers_df", "workers_owner",
               "result", "result_sig", "workers_editor", "fix_editor", "person_view"):
         st.session_state.pop(k, None)
     for k in [k for k in st.session_state if str(k).startswith(("mixdays_", "adj_", "rep_", "mail_"))]:
@@ -1938,7 +2181,7 @@ def render_tool(user: dict):
                             "Área Principal": ["atencion"] * len(names),
                             "Área mixta": [False] * len(names),
                             "Segunda Área": pd.Series([None] * len(names), dtype=object),
-                            "Correo": pd.Series([None] * len(names), dtype=object),
+                            "Correo": pd.Series([""] * len(names), dtype=object),
                         }),
                         file_info=f'{len(marks) + len(empties)} filas leídas de la hoja "{sheet}"'
                         + (f" ({'; '.join(extras)})." if extras else "."),
@@ -1969,6 +2212,14 @@ def render_tool(user: dict):
                 st.toggle(f"{day}: Pozo Único", value=False, key=f"single_{i}")
         modes = [bool(st.session_state.get(f"single_{i}", False)) for i in range(7)]
 
+        if user["role"] == "admin":
+            branches = load_users()
+            st.selectbox(
+                "Usar la configuración de la sucursal", [""] + sorted(branches), key="cfg_branch",
+                format_func=lambda u: "Valores por defecto (sin sucursal)" if not u else f"{branches[u]['name']} ({u})",
+                help="Carga los porcentajes, montos de Alfredo y correos guardados de esa sucursal. Los cambios que guardes se aplican solo a ella.",
+            )
+        owner = config_owner(user)
         pcts_vals, pcts_total = render_pct_config(user)
         pcts_ok = pcts_total == 100.0
 
@@ -1981,6 +2232,7 @@ def render_tool(user: dict):
         if "workers_df" not in st.session_state:
             st.info("Sube un archivo para ver aquí a los trabajadores y asignarles un área.")
         else:
+            prefill_saved_emails(owner)
             st.caption(
                 "Elige el Área Principal de cada persona. Si trabaja en dos áreas según el día, marca Área mixta, "
                 "elige su Segunda Área y luego indica abajo en qué días trabaja en ella."
@@ -1997,9 +2249,11 @@ def render_tool(user: dict):
                     "Área mixta": st.column_config.CheckboxColumn("Área mixta", help="Trabaja en dos áreas según el día de la semana."),
                     "Segunda Área": st.column_config.SelectboxColumn(
                         "Segunda Área", options=AREAS, required=False, help="Solo se usa si Área mixta está marcada."),
-                    "Correo": st.column_config.TextColumn("Correo", help="Opcional: para enviarle su resumen semanal."),
+                    "Correo": st.column_config.TextColumn("Correo", help="Opcional: para enviarle su resumen semanal. Usa el botón Guardar correos para que quede guardado en la sucursal.", max_chars=MAX_EMAIL_LEN),
                 },
             )
+
+            render_save_emails(owner, edited)
 
             for k in [k for k in st.session_state if str(k).startswith("mixdays_")]:
                 st.session_state[k] = st.session_state[k]
@@ -2263,11 +2517,22 @@ def render_admin_panel():
     if flash:
         st.success(flash)
 
-    st.info(
-        "Los cambios hechos aquí se guardan en un archivo del servidor. En Streamlit Cloud ese archivo se borra "
-        "cuando la app se reinicia o se vuelve a desplegar: para hacerlos permanentes, usa "
-        '"Generar configuración para st.secrets" al final de esta página.'
-    )
+    if storage_mode() == "supabase":
+        err_storage = storage_error()
+        if err_storage:
+            st.error(f"Almacenamiento permanente configurado, pero no responde: {err_storage}")
+        else:
+            st.success("Almacenamiento permanente activo (Supabase): usuarios, porcentajes, montos y correos no se pierden al reiniciar.")
+        if st.button("Probar conexión con la base de datos"):
+            problem = remote_health()
+            st.error(problem) if problem else st.success("Conexión correcta.")
+    else:
+        st.info(
+            "Los cambios hechos aquí se guardan en un archivo del servidor. En Streamlit Cloud ese archivo se borra "
+            "cuando la app se reinicia o se vuelve a desplegar: para hacerlos permanentes, configura [supabase] en Secrets "
+            "(recomendado, ver instrucciones al inicio del código) o usa "
+            '"Generar configuración para st.secrets" al final de esta página (no incluye correos).'
+        )
 
     render_section_heading("01", "Crear una sucursal", "Cada sucursal obtiene un usuario propio y parámetros iniciales de seguridad.")
     with st.form("create_branch", clear_on_submit=True):
@@ -2287,9 +2552,11 @@ def render_admin_panel():
     if not users:
         st.info("Todavía no hay sucursales. Crea la primera con el formulario de arriba.")
     else:
+        overlay = _read_overlay()
         table = pd.DataFrame(
             [
-                {"Usuario": u, "Sucursal": r["name"], "Estado": "Activa" if r["active"] else "Desactivada", "Origen": r["source"]}
+                {"Usuario": u, "Sucursal": r["name"], "Estado": "Activa" if r["active"] else "Desactivada", "Origen": r["source"],
+                 "Correos guardados": len((overlay.get(u) or {}).get("emails") or {})}
                 for u, r in sorted(users.items())
             ]
         )
