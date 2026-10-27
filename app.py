@@ -31,8 +31,9 @@ requirements.txt
     pct_atencion  = 70                         # opcional: % de reparto de la sucursal (deben sumar 100)
     pct_barra     = 10
     pct_cocina    = 20
-    alfredo_atencion = 500                     # opcional: aporte del bachero por asistencia (lunes a sábado)
-    alfredo_barra    = 100
+    bachero_atencion = 500                     # opcional: aporte del bachero por asistencia (lunes a sábado)
+    bachero_barra    = 100
+    bachero_cocina   = 100                     # (también se acepta el nombre antiguo alfredo_*)
 
 Envío de resumen por correo (opcional)
 --------------------------------------
@@ -50,9 +51,22 @@ Para enviar de verdad, agrega en Secrets:
 Con SMTP configurado, solo se puede enviar al correo cargado en la tabla de trabajadores
 (no a direcciones libres) y hay un límite de envíos por hora.
 
-Almacenamiento permanente (recomendado): Supabase
+Correos permanentes SIN servicios externos: Secrets
+---------------------------------------------------
+Streamlit Cloud no tiene disco permanente. Lo permanente son los Secrets. Los correos de cada sucursal
+se pueden dejar ahí (el panel de administración y el botón de cada sucursal generan el bloque):
+
+    [users.centro.emails]
+    "ANA PEREZ"  = "ana@correo.cl"
+    "LUIS SOTO"  = "luis@correo.cl"
+
+Se cargan solos cuando esa sucursal inicia sesión. Los cambios hechos desde la app se superponen a lo de Secrets.
+Si tu hosting SÍ tiene disco permanente (Render con disk, VPS, etc.), apunta USERS_DB_PATH a ese disco
+y el archivo JSON ya es permanente sin nada más.
+
+Almacenamiento permanente automático (opcional): Supabase
 -------------------------------------------------
-Sin esto, usuarios, porcentajes, montos de Alfredo y correos se guardan en un archivo que
+Sin esto, usuarios, porcentajes, montos de Bachero y correos se guardan en un archivo que
 Streamlit Cloud borra al reiniciar. Con Supabase quedan guardados por sucursal.
 
 1) En Supabase > SQL Editor ejecuta:
@@ -70,7 +84,7 @@ Streamlit Cloud borra al reiniciar. Con Supabase quedan guardados por sucursal.
     key   = "clave-service-role"
     table = "propinas_users"      # opcional
 
-Cada sucursal guarda su propio registro: contraseña (hash), estado, porcentajes, montos de Alfredo
+Cada sucursal guarda su propio registro: contraseña (hash), estado, porcentajes, montos de Bachero
 y correos de sus colaboradores. Nada se comparte entre sucursales.
 
 Cómo se guardan los accesos
@@ -237,9 +251,9 @@ PCT_AREAS = [("atencion", "Atención / Garzones"), ("barra", "Barra"), ("cocina"
 AREA_ORDER = ["atencion", "cocina", "barra"]
 TURNO_ORDER = {"Día": 0, "Noche": 1, "Único": 2, "Día completo": 3}
 
-DEFAULT_ALFREDO = {"atencion": 500, "barra": 100}
-ALFREDO_AREAS = [("atencion", "Garzón / Garzona"), ("barra", "Barra")]
-ALFREDO_WEEKDAYS = range(0, 6)  # 0 = Lunes ... 5 = Sábado
+DEFAULT_BACHERO = {"atencion": 500, "barra": 100, "cocina": 100}
+BACHERO_AREAS = [("atencion", "Garzón / Garzona"), ("barra", "Barra"), ("cocina", "Cocina")]
+BACHERO_WEEKDAYS = range(0, 6)  # 0 = Lunes ... 5 = Sábado
 
 REPLACEMENT_AREAS = ["atencion", "barra", "cocina"]
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -517,22 +531,43 @@ def _valid_pcts(p) -> bool:
     return all(0 <= v <= 100 for v in vals) and round(sum(vals), 6) == 100.0
 
 
-def _valid_alfredo(r) -> bool:
-    try:
-        vals = [float(r[a]) for a, _ in ALFREDO_AREAS]
-    except (KeyError, TypeError, ValueError):
-        return False
-    return all(0 <= v <= 100000 for v in vals)
+def _bachero_clean(r):
+    """Montos {área: pesos}. Las áreas que falten usan el valor por defecto (compatibilidad con datos
+    guardados antes de que cocina aportara). Devuelve None si algún monto no es válido."""
+    if not isinstance(r, dict):
+        return None
+    out = {}
+    for a, _ in BACHERO_AREAS:
+        v = r.get(a)
+        v = DEFAULT_BACHERO[a] if v is None else v
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= v <= 100000:
+            return None
+        out[a] = int(v)
+    return out
 
 
-def _alfredo_from_cfg(cfg: dict):
-    r = {a: cfg.get(f"alfredo_{a}") for a, _ in ALFREDO_AREAS}
-    return {a: int(float(v)) for a, v in r.items()} if _valid_alfredo(r) else None
+def _valid_bachero(r) -> bool:
+    return _bachero_clean(r) is not None
 
 
-def branch_alfredo(rec) -> dict:
-    r = (rec or {}).get("alfredo")
-    return {a: int(float(r[a])) for a, _ in ALFREDO_AREAS} if _valid_alfredo(r) else dict(DEFAULT_ALFREDO)
+def _bachero_from_cfg(cfg: dict):
+    """Montos del bachero definidos en st.secrets: bachero_atencion, bachero_barra, bachero_cocina (opcionales).
+    También se lee el nombre antiguo alfredo_* para no perder configuraciones ya guardadas."""
+    r = {}
+    for a, _ in BACHERO_AREAS:
+        v = cfg.get(f"bachero_{a}")
+        r[a] = cfg.get(f"alfredo_{a}") if v is None else v
+    if all(v is None for v in r.values()):
+        return None
+    return _bachero_clean(r)
+
+
+def branch_bachero(rec) -> dict:
+    return _bachero_clean((rec or {}).get("bachero")) or dict(DEFAULT_BACHERO)
 
 
 def _pcts_from_cfg(cfg: dict):
@@ -543,6 +578,22 @@ def _pcts_from_cfg(cfg: dict):
 def branch_pcts(rec) -> dict:
     p = (rec or {}).get("pcts")
     return {a: float(p[a]) for a, _ in PCT_AREAS} if _valid_pcts(p) else dict(DEFAULT_PCTS)
+
+
+def _emails_from_cfg(cfg: dict) -> dict:
+    """Correos definidos en st.secrets: sección [users.<sucursal>.emails] con "NOMBRE" = "correo"."""
+    raw, out = cfg.get("emails"), {}
+    if not raw:
+        return out
+    try:
+        items = dict(raw).items()
+    except (TypeError, ValueError):
+        return out
+    for name, mail in items:
+        mail = str(mail).strip()
+        if EMAIL_RE.match(mail) and len(mail) <= MAX_EMAIL_LEN:
+            out[email_key(name)] = {"name": str(name)[:80], "email": mail}
+    return out
 
 
 def _secret_users() -> dict:
@@ -556,7 +607,8 @@ def _secret_users() -> dict:
             "password_hash": cfg.get("password_hash"),
             "active": bool(cfg.get("active", True)),
             "pcts": _pcts_from_cfg(cfg),
-            "alfredo": _alfredo_from_cfg(cfg),
+            "bachero": _bachero_from_cfg(cfg),
+            "emails": _emails_from_cfg(cfg),
         }
     return users
 
@@ -690,7 +742,9 @@ def load_users() -> dict:
     overlay = _read_overlay()
     for uname, ov in overlay.items():
         rec = dict(users.get(uname, {"name": uname, "password": None, "password_hash": None, "active": True}))
-        rec.update({k: v for k, v in ov.items() if k in ("name", "password_hash", "active", "pcts", "alfredo")})
+        rec.update({k: v for k, v in ov.items() if k in ("name", "password_hash", "active", "pcts", "bachero")})
+        if "bachero" not in ov and isinstance(ov.get("alfredo"), dict):  # nombre antiguo de la clave
+            rec["bachero"] = ov["alfredo"]
         if "password_hash" in ov:
             rec["password"] = None
         users[uname] = rec
@@ -739,15 +793,15 @@ def set_pcts(uname: str, pcts: dict) -> str | None:
     return None
 
 
-def get_branch_alfredo(username: str) -> dict:
-    return branch_alfredo(load_users().get(username))
+def get_branch_bachero(username: str) -> dict:
+    return branch_bachero(load_users().get(username))
 
 
-def set_alfredo(uname: str, rates: dict) -> str | None:
-    if not _valid_alfredo(rates):
+def set_bachero(uname: str, rates: dict) -> str | None:
+    if not _valid_bachero(rates):
         return "Los montos deben ser números entre 0 y 100.000."
     try:
-        _update_overlay(uname, {"alfredo": {a: int(float(rates[a])) for a, _ in ALFREDO_AREAS}})
+        _update_overlay(uname, {"bachero": _bachero_clean(rates)})
     except OSError as e:
         return f"No se pudo guardar: {e}"
     return None
@@ -757,29 +811,45 @@ def email_key(name) -> str:
     return norm(name)
 
 
+def get_branch_email_entries(owner: str) -> dict:
+    """{clave: {"name", "email"}} de la sucursal: lo definido en Secrets (permanente) + lo guardado desde la app."""
+    entries = dict((load_users().get(owner) or {}).get("emails") or {})
+    saved = (_read_overlay().get(owner) or {}).get("emails")
+    if isinstance(saved, dict):
+        for k, v in saved.items():
+            if not isinstance(v, dict):
+                continue
+            mail = str(v.get("email", ""))
+            if mail == "":  # correo borrado desde la app (también oculta el de Secrets)
+                entries.pop(str(k), None)
+            elif EMAIL_RE.match(mail):
+                entries[str(k)] = {"name": str(v.get("name", k)), "email": mail}
+    return entries
+
+
 def get_branch_emails(owner: str) -> dict:
-    """{nombre normalizado: correo} guardados para esa sucursal (nunca mezcla con otros locales)."""
-    raw = (_read_overlay().get(owner) or {}).get("emails")
-    out = {}
-    if isinstance(raw, dict):
-        for k, v in raw.items():
-            if isinstance(v, dict) and EMAIL_RE.match(str(v.get("email", ""))):
-                out[str(k)] = str(v["email"])
-    return out
+    """{nombre normalizado: correo} de esa sucursal (nunca mezcla con otros locales)."""
+    return {k: v["email"] for k, v in get_branch_email_entries(owner).items()}
 
 
 def set_branch_emails(owner: str, entries: dict, remove) -> str | None:
     """Guarda/actualiza correos (entries = {nombre: correo}) y borra los de `remove` (lista de nombres)."""
-    if owner not in load_users():
+    users = load_users()
+    if owner not in users:
         return "La sucursal no existe."
     for name, mail in entries.items():
         if not EMAIL_RE.match(mail) or len(mail) > MAX_EMAIL_LEN:
             return f"El correo de {name} no es válido."
+    secret_keys = set(users[owner].get("emails") or {})
 
     def change(rec: dict) -> dict:
         current = dict(rec.get("emails") or {})
         for name in remove:
-            current.pop(email_key(name), None)
+            k = email_key(name)
+            if k in secret_keys:
+                current[k] = {"name": str(name)[:80], "email": ""}  # borra también el de Secrets
+            else:
+                current.pop(k, None)
         for name, mail in entries.items():
             current[email_key(name)] = {"name": name[:80], "email": mail}
         if len(current) > MAX_SAVED_EMAILS:
@@ -793,6 +863,51 @@ def set_branch_emails(owner: str, entries: dict, remove) -> str | None:
     except OSError as e:
         return f"No se pudo guardar: {e}"
     return None
+
+
+def emails_backup_json(owner: str) -> str:
+    """Copia de seguridad de los correos de UNA sucursal (para restaurarla después de un reinicio)."""
+    data = {
+        "version": 1,
+        "sucursal": owner,
+        "correos": [{"nombre": v["name"], "correo": v["email"]}
+                    for _k, v in sorted(get_branch_email_entries(owner).items())],
+    }
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def restore_emails_from_bytes(owner: str, raw: bytes) -> tuple[str | None, int]:
+    """Restaura una copia de seguridad. Devuelve (error | None, cantidad restaurada)."""
+    if len(raw) > 300_000:
+        return "El archivo es demasiado grande.", 0
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        items = data["correos"]
+        if not isinstance(items, list):
+            raise TypeError
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+        return "El archivo no es una copia de seguridad de correos válida.", 0
+    if data.get("sucursal") != owner:
+        return "Esta copia pertenece a otra sucursal; no se restauró para no mezclar correos.", 0
+    entries = {}
+    for it in items[:MAX_SAVED_EMAILS + 1]:
+        try:
+            name, mail = " ".join(str(it["nombre"]).split()), str(it["correo"]).strip()
+        except (KeyError, TypeError):
+            return "La copia tiene filas con formato incorrecto.", 0
+        if not name or not EMAIL_RE.match(mail) or len(mail) > MAX_EMAIL_LEN:
+            return f"La copia tiene un correo no válido ({name or 'sin nombre'}).", 0
+        entries[name] = mail
+    err = set_branch_emails(owner, entries, [])
+    return err, 0 if err else len(entries)
+
+
+def build_emails_toml(owner: str) -> str:
+    """Bloque para pegar en Settings > Secrets: deja los correos de la sucursal permanentes."""
+    entries = get_branch_email_entries(owner)
+    lines = [f"[users.{owner}.emails]"]
+    lines += [f'"{_toml_str(v["name"])}" = "{_toml_str(v["email"])}"' for _k, v in sorted(entries.items())]
+    return "\n".join(lines) + "\n"
 
 
 def set_active(uname: str, active: bool) -> str | None:
@@ -836,8 +951,12 @@ def build_secrets_toml(users: dict) -> str:
         ]
         if rec.get("pcts"):
             lines += [f"pct_{a} = {float(rec['pcts'][a])}" for a, _ in PCT_AREAS]
-        if rec.get("alfredo"):
-            lines += [f"alfredo_{a} = {int(rec['alfredo'][a])}" for a, _ in ALFREDO_AREAS]
+        if rec.get("bachero"):
+            lines += [f"bachero_{a} = {int(rec['bachero'][a])}" for a, _ in BACHERO_AREAS]
+        email_entries = get_branch_email_entries(uname)
+        if email_entries:
+            lines += ["", f"[users.{uname}.emails]"]
+            lines += [f'"{_toml_str(v["name"])}" = "{_toml_str(v["email"])}"' for _k, v in sorted(email_entries.items())]
         lines.append("")
     return "\n".join(lines)
 
@@ -1268,6 +1387,11 @@ def render_missing_marks():
 # ============================================================================
 # HERRAMIENTA: CÁLCULO
 # ============================================================================
+def join_es(items: list) -> str:
+    """['a', 'b', 'c'] -> 'a, b y c'"""
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " y " + items[-1]
+
+
 def money(n) -> str:
     return "$" + f"{int(round(n)):,}".replace(",", ".")
 
@@ -1280,7 +1404,7 @@ def fmt_date(d: date) -> str:
     return d.strftime("%d-%m-%Y")
 
 
-def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dict, alfredo_rates: dict,
+def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dict, bachero_rates: dict,
             adjustments=None, extra_hours=None) -> dict:
     """
     modes[i] = True  -> el día i (0 = Lunes) está en Modo Pozo Único.
@@ -1292,14 +1416,15 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
     Las propinas se reparten en pesos enteros con el método del mayor residuo: la suma de cada grupo
     coincide exactamente con su pozo (sin diferencias de redondeo).
 
-    Descuento Alfredo: por cada día de asistencia de lunes a sábado se descuenta el monto configurado según el área.
+    Aporte del bachero: por cada día de asistencia de lunes a sábado se descuenta el monto configurado según el área
+    que la persona tuvo ese día (por defecto: atención $500, barra $100 y cocina $100). Se cuenta una vez por día.
     """
     missing_pct = [a for a in AREA_ORDER if a not in pcts]
     if missing_pct or any(v < 0 for v in pcts.values()) or abs(sum(pcts.values()) - 1) > 1e-9:
         raise ValueError("Los porcentajes de reparto deben sumar exactamente 100%.")
 
-    if any(a not in alfredo_rates or alfredo_rates[a] < 0 for a, _ in ALFREDO_AREAS):
-        raise ValueError("Los montos de Alfredo deben ser números mayores o iguales a 0.")
+    if any(a not in bachero_rates or bachero_rates[a] < 0 for a, _ in BACHERO_AREAS):
+        raise ValueError("Los montos de Bachero deben ser números mayores o iguales a 0.")
 
     def area_of(name: str, d: date) -> str:
         week = areas.get(name)
@@ -1459,11 +1584,11 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
             unassigned += total
             warnings.append(f"{DAYS[wd]}: ingresaste {money(total)} pero no hay horas registradas. Quedan sin repartir.")
 
-    # 6) Descuento Alfredo y resumen por colaborador
-    alfredo_dates = defaultdict(set)
+    # 6) Descuento Bachero y resumen por colaborador
+    bachero_dates = defaultdict(set)
     for r in rows:
-        if r["area"] in alfredo_rates and r["date"].weekday() in ALFREDO_WEEKDAYS:
-            alfredo_dates[(r["name"], r["area"])].add(r["date"])
+        if r["area"] in bachero_rates and r["date"].weekday() in BACHERO_WEEKDAYS:
+            bachero_dates[(r["name"], r["area"])].add(r["date"])
 
     people = {}
     for r in rows:
@@ -1475,14 +1600,14 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
     repl_names = {e["name"] for e in extra_hours or []}
     summary = []
     for name, p in people.items():
-        days = sum(len(v) for (n, _a), v in alfredo_dates.items() if n == name)
-        alfredo = sum(alfredo_rates[a] * len(v) for (n, a), v in alfredo_dates.items() if n == name)
+        days = sum(len(v) for (n, _a), v in bachero_dates.items() if n == name)
+        bachero = sum(bachero_rates[a] * len(v) for (n, a), v in bachero_dates.items() if n == name)
         tip = int(p["tip"])
         areas_sorted = sorted(p["areas"], key=AREA_ORDER.index)
         summary.append({
             "name": name, "area": " / ".join(areas_sorted), "_order": AREA_ORDER.index(areas_sorted[0]),
             "hours": p["hours"], "adj_hours": adj_applied.get(name, 0.0), "tip": tip,
-            "alfredo_days": days, "alfredo": alfredo, "total": tip - alfredo,
+            "bachero_days": days, "bachero": bachero, "total": tip - bachero,
             "replacement": name in repl_names,
         })
     summary.sort(key=lambda x: (x["_order"], x["name"].casefold()))
@@ -1495,9 +1620,9 @@ def compute(pairs, areas: dict, modes: list, cut_sec: int, tips: dict, pcts: dic
         warnings.insert(0, f"Se aplicaron {n_adj} ajuste{'s' if n_adj != 1 else ''} manual{'es' if n_adj != 1 else ''} de horas ({net_txt} h netas).")
 
     return {
-        "alfredo_rates": dict(alfredo_rates),
+        "bachero_rates": dict(bachero_rates),
         "summary": summary,
-        "alfredo_total": sum(x["alfredo"] for x in summary),
+        "bachero_total": sum(x["bachero"] for x in summary),
         "rows": rows,
         "warnings": warnings,
         "unassigned": unassigned,
@@ -1525,7 +1650,7 @@ def results_dataframe(result: dict) -> pd.DataFrame:
 
 
 SUMMARY_COLS = ["Nombre", "Área", "Horas Trabajadas", "Ajuste manual (h)", "Propina ($)",
-                "Asistencias (L-S)", "Alfredo", "Total menos alfredo"]
+                "Asistencias (L-S)", "Bachero", "Total menos bachero"]
 
 
 def summary_dataframe(result: dict) -> pd.DataFrame:
@@ -1537,9 +1662,9 @@ def summary_dataframe(result: dict) -> pd.DataFrame:
                 "Horas Trabajadas": round(s["hours"], 2),
                 "Ajuste manual (h)": round(s["adj_hours"], 2),
                 "Propina ($)": s["tip"],
-                "Asistencias (L-S)": s["alfredo_days"],
-                "Alfredo": s["alfredo"],
-                "Total menos alfredo": s["total"],
+                "Asistencias (L-S)": s["bachero_days"],
+                "Bachero": s["bachero"],
+                "Total menos bachero": s["total"],
             }
             for s in result["summary"]
         ],
@@ -1547,7 +1672,7 @@ def summary_dataframe(result: dict) -> pd.DataFrame:
     )
 
 
-WEEK_COLS = ["Día", "Área", "Horas Trabajadas", "Propina ($)", "Alfredo", "Neto del día ($)"]
+WEEK_COLS = ["Día", "Área", "Horas Trabajadas", "Propina ($)", "Bachero", "Neto del día ($)"]
 
 
 def person_week_dataframe(result: dict, name: str) -> pd.DataFrame:
@@ -1561,12 +1686,12 @@ def person_week_dataframe(result: dict, name: str) -> pd.DataFrame:
     out = []
     for d in sorted(by_date):
         b = by_date[d]
-        alfredo = result["alfredo_rates"].get(b["area"], 0) if d.weekday() in ALFREDO_WEEKDAYS else 0
+        bachero = result["bachero_rates"].get(b["area"], 0) if d.weekday() in BACHERO_WEEKDAYS else 0
         tip = int(round(b["tip"]))
         out.append({
             "Día": f"{DAYS[d.weekday()]} {fmt_date(d)}", "Área": b["area"],
             "Horas Trabajadas": round(b["hours"], 2), "Propina ($)": tip,
-            "Alfredo": alfredo, "Neto del día ($)": tip - alfredo,
+            "Bachero": bachero, "Neto del día ($)": tip - bachero,
         })
     return pd.DataFrame(out, columns=WEEK_COLS)
 
@@ -1594,8 +1719,8 @@ def to_excel_bytes(df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
           "Ajuste manual (h)": round(summary_df["Ajuste manual (h)"].sum(), 2),
           "Propina ($)": int(summary_df["Propina ($)"].sum()),
           "Asistencias (L-S)": int(summary_df["Asistencias (L-S)"].sum()),
-          "Alfredo": int(summary_df["Alfredo"].sum()),
-          "Total menos alfredo": int(summary_df["Total menos alfredo"].sum())}]
+          "Bachero": int(summary_df["Bachero"].sum()),
+          "Total menos bachero": int(summary_df["Total menos bachero"].sum())}]
     )
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
@@ -1658,7 +1783,7 @@ def build_email_body(result: dict, srec: dict, wdf: pd.DataFrame, signer: str) -
     for r in wdf.to_dict("records"):
         lines.append(
             f"- {r['Día']} | {r['Área']} | {hours_fmt(r['Horas Trabajadas'])} h | "
-            f"Propina {money(r['Propina ($)'])} | Alfredo {money(r['Alfredo'])} | Neto {money(r['Neto del día ($)'])}"
+            f"Propina {money(r['Propina ($)'])} | Bachero {money(r['Bachero'])} | Neto {money(r['Neto del día ($)'])}"
         )
     horas = f"- Horas trabajadas: {hours_fmt(srec['hours'])} h"
     if srec["adj_hours"]:
@@ -1666,8 +1791,8 @@ def build_email_body(result: dict, srec: dict, wdf: pd.DataFrame, signer: str) -
     lines += [
         "", "Resumen:", horas,
         f"- Propina: {money(srec['tip'])}",
-        f"- Alfredo: {money(srec['alfredo'])} ({srec['alfredo_days']} asistencias de lunes a sábado)",
-        f"- Total menos alfredo: {money(srec['total'])}",
+        f"- Bachero: {money(srec['bachero'])} ({srec['bachero_days']} asistencias de lunes a sábado)",
+        f"- Total menos bachero: {money(srec['total'])}",
         "", "Saludos,", signer,
     ]
     return "\n".join(lines)
@@ -1748,12 +1873,28 @@ def describe_week(week: list) -> str:
     return "; ".join(parts)
 
 
-def expand_replacements(reps: list) -> list:
+def split_shift(ent: int, sal: int, cut_sec: int) -> tuple[float, float]:
+    """Horas de un tramo [entrada, salida] que caen en el bloque Día (antes de la hora de corte) y en el
+    bloque Noche (desde la hora de corte). Es la misma regla que se usa con las marcas del reloj.
+    Si la salida es menor o igual que la entrada, se entiende que cruzó medianoche."""
+    if sal <= ent:
+        sal += DAY_SECONDS
+    day = max(0, min(sal, cut_sec) - ent) / 3600
+    night = max(0, sal - max(ent, cut_sec)) / 3600
+    return day, night
+
+
+def expand_replacements(reps: list, cut_sec: int) -> list:
+    """Convierte cada reemplazo en filas (nombre, fecha, turno, horas): el horario real de cada día se
+    prorratea entre el turno Día y el turno Noche según las horas trabajadas en cada bloque."""
     out = []
     for rp in reps:
-        for d, h in sorted(rp["hours_by_date"].items()):
-            if h > 0:
-                out.append({"name": rp["name"], "date": d, "turno": rp["turno"], "hours": h})
+        for d, (ent, sal) in sorted(rp["days"].items()):
+            day_h, night_h = split_shift(ent, sal, cut_sec)
+            if day_h > 0:
+                out.append({"name": rp["name"], "date": d, "turno": "Día", "hours": day_h})
+            if night_h > 0:
+                out.append({"name": rp["name"], "date": d, "turno": "Noche", "hours": night_h})
     return out
 
 
@@ -1770,7 +1911,6 @@ def add_replacement(taken: set):
     name = " ".join(str(ss.get("rep_name") or "").split())
     area = ss.get("rep_area")
     days = sorted(ss.get("rep_dates") or [])
-    hours_by_date = {d: float(ss.get(f"rep_h_{d.isoformat()}") or 0.0) for d in days}
     mail = (ss.get("rep_email") or "").strip()
     reps = ss.setdefault("replacements", [])
 
@@ -1787,19 +1927,37 @@ def add_replacement(taken: set):
         return fail("Elige el área del reemplazo.")
     if not days:
         return fail("Elige al menos un día trabajado.")
-    missing = [d for d, h in hours_by_date.items() if h <= 0]
+
+    spans, missing, same, too_long = {}, [], [], []
+    for d in days:
+        label = f"{DAYS[d.weekday()]} {d:%d-%m}"
+        ent = parse_time(ss.get(f"rep_in_{d.isoformat()}"))
+        sal = parse_time(ss.get(f"rep_out_{d.isoformat()}"))
+        if ent is None or sal is None:
+            missing.append(label)
+            continue
+        if ent == sal:
+            same.append(label)
+            continue
+        if sal < ent:  # salió después de medianoche
+            sal += DAY_SECONDS
+        if sal - ent > MAX_SHIFT_SECONDS:
+            too_long.append(label)
+            continue
+        spans[d] = (ent, sal)
     if missing:
-        return fail("Indica las horas trabajadas de cada día. Faltan: "
-                    + ", ".join(f"{DAYS[d.weekday()]} {d:%d-%m}" for d in missing) + ".")
-    if any(h > 24 for h in hours_by_date.values()):
-        return fail("Un día no puede tener más de 24 horas.")
+        return fail("Indica la hora de entrada y de salida de cada día. Faltan: " + ", ".join(missing) + ".")
+    if same:
+        return fail("La entrada y la salida no pueden ser iguales: " + ", ".join(same) + ".")
+    if too_long:
+        return fail("Un turno no puede durar más de 16 horas. Revisa: " + ", ".join(too_long) + ".")
     if mail and not EMAIL_RE.match(mail):
         return fail("El correo no es válido.")
 
-    reps.append({"name": name, "area": area, "hours_by_date": hours_by_date,
-                 "turno": ss.get("rep_turno", "Día"), "email": mail})
+    reps.append({"name": name, "area": area, "days": spans, "email": mail})
     for d in days:
-        ss.pop(f"rep_h_{d.isoformat()}", None)
+        ss.pop(f"rep_in_{d.isoformat()}", None)
+        ss.pop(f"rep_out_{d.isoformat()}", None)
     ss["rep_name"], ss["rep_dates"], ss["rep_email"] = "", [], ""
     ss["rep_msg"] = ("ok", f"Reemplazo \"{name}\" agregado.")
 
@@ -1810,17 +1968,20 @@ def remove_replacement(i: int):
         lst.pop(i)
 
 
-def render_replacements(att, taken: set, cutoff):
+def render_replacements(att, taken: set, cutoff, modes: list):
+    """Registro de reemplazos y personal temporal que no aparece en el reloj de control."""
+    ss = st.session_state
+    cut_sec = cutoff.hour * 3600 + cutoff.minute * 60 + cutoff.second
     st.caption(
-        "Registra a quienes trabajaron sin marcar en el reloj: indica nombre, área, días trabajados y horas totales. "
-        "Participan en el reparto de propinas y en el descuento Alfredo como cualquier colaborador. "
-        "Al elegir los días aparece un campo para escribir las horas exactas de cada uno."
+        "Registra a quienes trabajaron sin marcar en el reloj: indica nombre, área, días trabajados y la hora de entrada y de salida de cada día. "
+        f"Si el horario cruza la hora de corte ({cutoff:%H:%M}), las horas se reparten solas entre el turno Día y el turno Noche "
+        "según lo realmente trabajado en cada bloque. Participan en el reparto de propinas y en el descuento Bachero como cualquier colaborador."
     )
     if att is None:
         st.info("Sube un archivo para registrar reemplazos: los días se eligen entre las fechas del archivo.")
         return
 
-    msg = st.session_state.pop("rep_msg", None)
+    msg = ss.pop("rep_msg", None)
     if msg:
         (st.success if msg[0] == "ok" else st.error)(msg[1])
 
@@ -1831,39 +1992,50 @@ def render_replacements(att, taken: set, cutoff):
         st.selectbox("Área asignada", REPLACEMENT_AREAS, key="rep_area")
     st.multiselect("Días trabajados", file_dates(att), key="rep_dates",
                    format_func=lambda d: f"{DAYS[d.weekday()]} {fmt_date(d)}")
-    selected = sorted(st.session_state.get("rep_dates") or [])
+    selected = sorted(ss.get("rep_dates") or [])
     if selected:
-        st.markdown("**Horas trabajadas por día**")
-        hour_cols = st.columns(4)
-        for i, d in enumerate(selected):
-            with hour_cols[i % 4]:
-                st.number_input(f"{DAYS[d.weekday()]} {d:%d-%m}", min_value=0.0, max_value=24.0, step=0.25,
-                                value=0.0, format="%.2f", key=f"rep_h_{d.isoformat()}")
-        total = sum(float(st.session_state.get(f"rep_h_{d.isoformat()}") or 0.0) for d in selected)
+        st.markdown("**Horario trabajado en cada día**")
+        total = 0.0
+        for d in selected:
+            iso, wd = d.isoformat(), d.weekday()
+            short = f"{DAYS[wd][:3]} {d:%d-%m}"
+            ca, cb = st.columns(2)
+            with ca:
+                st.time_input(f"Entrada · {short}", value=None, step=300, key=f"rep_in_{iso}")
+            with cb:
+                st.time_input(f"Salida · {short}", value=None, step=300, key=f"rep_out_{iso}")
+            ent, sal = parse_time(ss.get(f"rep_in_{iso}")), parse_time(ss.get(f"rep_out_{iso}"))
+            if ent is None or sal is None:
+                continue
+            if ent == sal:
+                st.caption("La entrada y la salida son iguales: revisa el horario.")
+                continue
+            day_h, night_h = split_shift(ent, sal, cut_sec)
+            total += day_h + night_h
+            if modes[wd]:
+                st.caption(f"{hours_fmt(day_h + night_h)} h. Ese día está en Pozo Único: todas las horas cuentan en un solo pozo.")
+            elif ss.get("rep_area") == "cocina":
+                st.caption(f"{hours_fmt(day_h + night_h)} h. Cocina se reparte por día entero: las horas se suman.")
+            else:
+                st.caption(f"Turno Día: {hours_fmt(day_h)} h · Turno Noche: {hours_fmt(night_h)} h")
         st.caption(f"Total: {hours_fmt(total)} h en {len(selected)} día(s).")
     else:
-        st.caption("Elige los días trabajados para ingresar las horas de cada uno.")
+        st.caption("Elige los días trabajados para ingresar el horario de cada uno.")
 
-    c3, c4 = st.columns(2)
-    with c3:
-        st.selectbox("Turno", ["Día", "Noche"], key="rep_turno",
-                     help=f"Se usa en los días en Modo Turnos (Día: antes de las {cutoff:%H:%M}; Noche: desde esa hora). "
-                          "En Pozo Único y en cocina se ignora.")
-    with c4:
-        st.text_input("Correo (opcional)", key="rep_email", help="Para enviarle su resumen semanal.")
+    st.text_input("Correo (opcional)", key="rep_email", help="Para enviarle su resumen semanal.")
     st.button("Agregar reemplazo", on_click=add_replacement, args=(taken,))
 
-    reps = st.session_state.get("replacements", [])
+    reps = ss.get("replacements", [])
     if reps:
         st.markdown("**Reemplazos cargados**")
         for i, rp in enumerate(reps):
             col_t, col_b = st.columns([5, 1])
             days_txt = ", ".join(
-                f"{DAYS[d.weekday()][:3]} {d:%d-%m}: {hours_fmt(h)} h" for d, h in sorted(rp["hours_by_date"].items())
+                f"{DAYS[d.weekday()][:3]} {d:%d-%m}: {hhmm(e)}–{hhmm(x)}" for d, (e, x) in sorted(rp["days"].items())
             )
+            total_h = sum((x - e) / 3600 for e, x in rp["days"].values())
             col_t.markdown(
-                f"{rp['name']}: {rp['area']}, {hours_fmt(sum(rp['hours_by_date'].values()))} h en "
-                f"{len(rp['hours_by_date'])} día(s) ({days_txt})"
+                f"{rp['name']}: {rp['area']}, {hours_fmt(total_h)} h en {len(rp['days'])} día(s) ({days_txt})"
             )
             col_b.button("Quitar", key=f"rep_del_{i}", on_click=remove_replacement, args=(i,))
 
@@ -1935,47 +2107,47 @@ def render_pct_config(user: dict):
     return vals, total
 
 
-def save_my_alfredo():
+def save_my_bachero():
     ss = st.session_state
     auth = ss.get("auth") or {}
     owner = config_owner(auth) if auth else ""
     if not owner:
         return
-    vals = {a: int(ss.get(f"alf_{a}") or 0) for a, _ in ALFREDO_AREAS}
-    err = set_alfredo(owner, vals)
-    ss["alf_msg"] = ("error", err) if err else ("ok", "Montos guardados como los de tu sucursal.")
+    vals = {a: int(ss.get(f"bach_{a}") or 0) for a, _ in BACHERO_AREAS}
+    err = set_bachero(owner, vals)
+    ss["bach_msg"] = ("error", err) if err else ("ok", "Montos guardados como los de tu sucursal.")
 
 
-def render_alfredo_config(user: dict) -> dict:
+def render_bachero_config(user: dict) -> dict:
     ss = st.session_state
     owner = config_owner(user)
-    saved = get_branch_alfredo(owner) if owner else dict(DEFAULT_ALFREDO)
+    saved = get_branch_bachero(owner) if owner else dict(DEFAULT_BACHERO)
     stamp = (owner, tuple(sorted(saved.items())))
-    if ss.get("alf_stamp") != stamp:
-        for a, _ in ALFREDO_AREAS:
-            ss[f"alf_{a}"] = int(saved[a])
-        ss["alf_stamp"] = stamp
+    if ss.get("bach_stamp") != stamp:
+        for a, _ in BACHERO_AREAS:
+            ss[f"bach_{a}"] = int(saved[a])
+        ss["bach_stamp"] = stamp
 
-    with st.expander("Aporte del bachero (Alfredo)"):
+    with st.expander("Aporte del bachero"):
         st.caption(
             "Monto que se descuenta a cada persona por cada día que asistió de lunes a sábado, según su área ese día. "
-            "Se multiplica por los días reales asistidos y se resta en la columna Alfredo. "
-            "Cocina no aporta. Puedes subir o bajar los montos."
+            "Se multiplica por los días reales asistidos y se resta en la columna Bachero. "
+            "Puedes subir o bajar el monto de cada área."
         )
-        cols = st.columns(2)
-        for col, (a, label) in zip(cols, ALFREDO_AREAS):
+        cols = st.columns(len(BACHERO_AREAS))
+        for col, (a, label) in zip(cols, BACHERO_AREAS):
             with col:
                 st.number_input(f"{label}: aporte por asistencia ($)", min_value=0, max_value=100000,
-                                step=100, key=f"alf_{a}")
+                                step=100, key=f"bach_{a}")
         if owner:
             st.button("Guardar como montos de mi sucursal" if user["role"] == "sucursal" else "Guardar como montos de la sucursal elegida",
-                      on_click=save_my_alfredo)
+                      on_click=save_my_bachero)
         else:
             st.caption("Estos montos valen solo para esta sesión. Elige una sucursal arriba o usa el Panel de Control de Acceso para fijarlos.")
-        msg = ss.pop("alf_msg", None)
+        msg = ss.pop("bach_msg", None)
         if msg:
             (st.success if msg[0] == "ok" else st.error)(msg[1])
-    return {a: int(ss.get(f"alf_{a}") or 0) for a, _ in ALFREDO_AREAS}
+    return {a: int(ss.get(f"bach_{a}") or 0) for a, _ in BACHERO_AREAS}
 
 
 def fmt_minutes(mins: int) -> str:
@@ -2092,24 +2264,22 @@ def prefill_saved_emails(owner: str):
 
 
 def render_save_emails(owner: str, edited: pd.DataFrame):
-    """Botón para guardar de forma permanente los correos de la tabla en la sucursal activa."""
-    n_saved = len(get_branch_emails(owner)) if owner else 0
+    """Guarda los correos de la tabla en la sucursal activa y ofrece formas de hacerlos permanentes."""
+    ss = st.session_state
     if not owner:
         st.caption("Los correos de esta tabla valen solo para esta sesión. Elige una sucursal arriba para guardarlos.")
         return
-    if storage_mode() == "archivo":
-        st.warning(
-            "Almacenamiento temporal: los correos se guardan en un archivo que Streamlit Cloud borra al reiniciar la app. "
-            "Para que sean permanentes configura [supabase] en Secrets (ver instrucciones al inicio del código)."
-        )
+    n_saved = len(get_branch_emails(owner))
+    temporary = storage_mode() == "archivo"
     err_storage = storage_error()
     if err_storage:
         st.error(f"No se pudo leer la base de datos ({err_storage}). Se muestran los últimos datos conocidos.")
+
     c1, c2 = st.columns([1, 2])
     with c1:
         clicked = st.button("Guardar correos de la sucursal", key="save_emails_btn")
     with c2:
-        st.caption(f"Correos guardados en esta sucursal: {n_saved}. Se cargan solos cada semana; "
+        st.caption(f"Correos guardados en esta sucursal: {n_saved}. Se cargan solos al iniciar sesión; "
                    "si dejas vacío el correo de alguien y guardas, se borra el suyo.")
     if clicked:
         entries, remove, bad = {}, [], []
@@ -2130,6 +2300,40 @@ def render_save_emails(owner: str, edited: pd.DataFrame):
                 st.error(err)
             else:
                 st.success(f"Correos guardados: {len(entries)}" + (f" ({len(remove)} sin correo)." if remove else "."))
+                if temporary:
+                    st.info("Quedaron guardados mientras la app siga encendida. Para que sobrevivan a un reinicio, "
+                            "descarga la copia de seguridad o haz que el administrador los agregue a Secrets (ver abajo).")
+
+    with st.expander("Hacer los correos permanentes (copia de seguridad / Secrets)", expanded=False):
+        if temporary:
+            st.warning(
+                "Streamlit Cloud borra los archivos de la app cuando la reinicia, y no tiene disco permanente. "
+                "Por eso los correos guardados desde la app se pierden en un reinicio, salvo que uses una de estas dos opciones."
+            )
+        st.markdown("**Opción 1: copia de seguridad (la hace la propia sucursal)**")
+        st.caption("Descarga la copia después de guardar. Si la app se reinicia y los correos desaparecen, súbela aquí para recuperarlos en un clic.")
+        st.download_button("Descargar copia de seguridad de correos", data=emails_backup_json(owner),
+                           file_name=f"correos_{owner}.json", mime="application/json", key="dl_emails_backup")
+        up = st.file_uploader("Restaurar correos desde una copia", type=["json"], key="restore_emails_file")
+        if up is not None and st.button("Restaurar correos", key="restore_emails_btn"):
+            err, n = restore_emails_from_bytes(owner, up.getvalue())
+            if err:
+                st.error(err)
+            else:
+                ss.pop("workers_owner", None)  # vuelve a rellenar la tabla con los correos restaurados
+                ss.pop("workers_editor", None)
+                ss["emails_flash"] = f"Se restauraron {n} correos."
+                st.rerun()
+        st.markdown("**Opción 2: permanentes en Secrets (la hace el administrador, una vez)**")
+        st.caption(
+            "Pega este bloque en Settings > Secrets de la app, debajo de la sección [users." + owner + "]. "
+            "Se cargan solos cada vez que la sucursal inicia sesión y no se pierden nunca. Cuando agregues correos nuevos, "
+            "vuelve a copiar el bloque."
+        )
+        st.code(build_emails_toml(owner), language="toml")
+    flash = ss.pop("emails_flash", None)
+    if flash:
+        st.success(flash)
 
 
 def reset_tool_state():
@@ -2217,13 +2421,13 @@ def render_tool(user: dict):
             st.selectbox(
                 "Usar la configuración de la sucursal", [""] + sorted(branches), key="cfg_branch",
                 format_func=lambda u: "Valores por defecto (sin sucursal)" if not u else f"{branches[u]['name']} ({u})",
-                help="Carga los porcentajes, montos de Alfredo y correos guardados de esa sucursal. Los cambios que guardes se aplican solo a ella.",
+                help="Carga los porcentajes, montos de Bachero y correos guardados de esa sucursal. Los cambios que guardes se aplican solo a ella.",
             )
         owner = config_owner(user)
         pcts_vals, pcts_total = render_pct_config(user)
         pcts_ok = pcts_total == 100.0
 
-        alfredo_vals = render_alfredo_config(user)
+        bachero_vals = render_bachero_config(user)
 
         st.markdown("**Trabajadores encontrados**")
         areas = {}
@@ -2289,13 +2493,14 @@ def render_tool(user: dict):
         taken = {str(n).casefold() for n in areas}
         with st.expander("Reemplazos y personal sin marcaje (opcional)",
                          expanded=bool(st.session_state.get("replacements"))):
-            render_replacements(st.session_state.get("attendance"), taken, cutoff)
+            render_replacements(st.session_state.get("attendance"), taken, cutoff, modes)
         replacements = list(st.session_state.get("replacements", []))
         for rp in replacements:
             areas[rp["name"]] = [rp["area"]] * 7
             if rp.get("email"):
                 emails[rp["name"]] = rp["email"]
-        extra_hours = expand_replacements(replacements)
+        cutoff_sec = cutoff.hour * 3600 + cutoff.minute * 60 + cutoff.second
+        extra_hours = expand_replacements(replacements, cutoff_sec)
         st.session_state["emails"] = emails
 
         zero_areas = [a for a, _ in PCT_AREAS if pcts_vals[a] == 0]
@@ -2360,9 +2565,9 @@ def render_tool(user: dict):
         )
 
         signature = json.dumps(
-            {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips, "p": pcts_vals, "q": alfredo_vals,
+            {"f": st.session_state.get("file_sig"), "m": modes, "c": str(cutoff), "a": areas, "t": tips, "p": pcts_vals, "q": bachero_vals,
              "j": [(a["name"], str(a["date"]), a["turno"], a["minutes"]) for a in adjustments],
-             "r": [(rp["name"], rp["area"], sorted((str(d), h) for d, h in rp["hours_by_date"].items()), rp["turno"])
+             "r": [(rp["name"], rp["area"], sorted((str(d), e, x) for d, (e, x) in rp["days"].items()))
                    for rp in replacements],
              "x": sorted((str(k), v["s"], v["drop"]) for k, v in (st.session_state.get("fixes") or {}).items())},
             sort_keys=True, ensure_ascii=False,
@@ -2389,7 +2594,7 @@ def render_tool(user: dict):
                 if mixed_errors:
                     raise ValueError("Elige la Segunda Área de: " + ", ".join(mixed_errors) + ".")
                 pcts = {a: v / 100 for a, v in pcts_vals.items()}
-                result = compute(pairs, areas, modes, cut_sec, tips, pcts, alfredo_vals, adjustments, extra_hours)
+                result = compute(pairs, areas, modes, cut_sec, tips, pcts, bachero_vals, adjustments, extra_hours)
                 incomplete_keys = [
                     (r["Nombre"], r["Fecha"])
                     for r in attendance[review_mask(attendance)].to_dict("records")
@@ -2436,19 +2641,19 @@ def render_results(result: dict, stale: bool):
 
         st.markdown(f"**Resumen por colaborador** ({len(sview)} personas)")
         st.caption(
-            "Alfredo: se descuentan " + " y ".join(
-                f"{money(result['alfredo_rates'][a])} en {a}" for a, _ in ALFREDO_AREAS) +
+            "Bachero: se descuentan " + join_es(
+                [f"{money(result['bachero_rates'][a])} en {a}" for a, _ in BACHERO_AREAS]) +
             " por cada día de asistencia de lunes a sábado (atencion = garzón/garzona). "
-            "Total menos alfredo = Propina − Alfredo."
+            "Total menos bachero = Propina − Bachero."
         )
         s_styled = sview.style.format({
             "Horas Trabajadas": hours_fmt, "Ajuste manual (h)": signed_hours,
-            "Propina ($)": money, "Alfredo": money, "Total menos alfredo": money,
+            "Propina ($)": money, "Bachero": money, "Total menos bachero": money,
         })
         st.dataframe(s_styled, hide_index=True, width="stretch")
         st.markdown(
             f"**Total{' (filas filtradas)' if query else ''}:** propinas {money(sview['Propina ($)'].sum())}, "
-            f"Alfredo {money(sview['Alfredo'].sum())}, total menos alfredo {money(sview['Total menos alfredo'].sum())}"
+            f"Bachero {money(sview['Bachero'].sum())}, total menos bachero {money(sview['Total menos bachero'].sum())}"
         )
 
         st.markdown("**Resumen semanal por colaborador**")
@@ -2462,9 +2667,9 @@ def render_results(result: dict, stale: bool):
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Horas trabajadas", hours_fmt(srec["hours"]))
             m2.metric("Propina ($)", money(srec["tip"]))
-            m3.metric("Alfredo", money(srec["alfredo"]))
-            m4.metric("Total menos alfredo", money(srec["total"]))
-            extra = f"Área: {srec['area']}. Asistencias de lunes a sábado: {srec['alfredo_days']}."
+            m3.metric("Bachero", money(srec["bachero"]))
+            m4.metric("Total menos bachero", money(srec["total"]))
+            extra = f"Área: {srec['area']}. Asistencias de lunes a sábado: {srec['bachero_days']}."
             if srec["adj_hours"]:
                 extra += f" Ajuste manual incluido en las horas: {signed_hours(srec['adj_hours'])} h."
             if srec.get("replacement"):
@@ -2472,7 +2677,7 @@ def render_results(result: dict, stale: bool):
             st.caption(extra)
             wdf = person_week_dataframe(result, person)
             st.dataframe(
-                wdf.style.format({"Horas Trabajadas": hours_fmt, "Propina ($)": money, "Alfredo": money, "Neto del día ($)": money}),
+                wdf.style.format({"Horas Trabajadas": hours_fmt, "Propina ($)": money, "Bachero": money, "Neto del día ($)": money}),
                 hide_index=True, width="stretch",
             )
             render_email_panel(result, srec, wdf)
@@ -2530,8 +2735,8 @@ def render_admin_panel():
         st.info(
             "Los cambios hechos aquí se guardan en un archivo del servidor. En Streamlit Cloud ese archivo se borra "
             "cuando la app se reinicia o se vuelve a desplegar: para hacerlos permanentes, configura [supabase] en Secrets "
-            "(recomendado, ver instrucciones al inicio del código) o usa "
-            '"Generar configuración para st.secrets" al final de esta página (no incluye correos).'
+            "(opcional, ver instrucciones al inicio del código) o usa "
+            '"Generar configuración para st.secrets" al final de esta página (incluye porcentajes, montos y correos).'
         )
 
     render_section_heading("01", "Crear una sucursal", "Cada sucursal obtiene un usuario propio y parámetros iniciales de seguridad.")
@@ -2552,11 +2757,10 @@ def render_admin_panel():
     if not users:
         st.info("Todavía no hay sucursales. Crea la primera con el formulario de arriba.")
     else:
-        overlay = _read_overlay()
         table = pd.DataFrame(
             [
                 {"Usuario": u, "Sucursal": r["name"], "Estado": "Activa" if r["active"] else "Desactivada", "Origen": r["source"],
-                 "Correos guardados": len((overlay.get(u) or {}).get("emails") or {})}
+                 "Correos guardados": len(get_branch_emails(u))}
                 for u, r in sorted(users.items())
             ]
         )
@@ -2619,21 +2823,21 @@ def render_admin_panel():
                         st.session_state["flash"] = f'Porcentajes de "{rec["name"]}" guardados.'
                         st.rerun()
 
-        st.markdown("**Aporte del bachero (Alfredo) de la sucursal**")
-        cur_alf = branch_alfredo(rec)
-        with st.form(f"alf_form_{selected}"):
-            ac = st.columns(2)
-            new_alf = {}
-            for col, (area, label) in zip(ac, ALFREDO_AREAS):
+        st.markdown("**Aporte del bachero de la sucursal**")
+        cur_bach = branch_bachero(rec)
+        with st.form(f"bach_form_{selected}"):
+            ac = st.columns(len(BACHERO_AREAS))
+            new_bach = {}
+            for col, (area, label) in zip(ac, BACHERO_AREAS):
                 with col:
-                    new_alf[area] = st.number_input(f"{label}: aporte por asistencia ($)", min_value=0, max_value=100000,
-                                                    step=100, value=int(cur_alf[area]), key=f"adm_alf_{selected}_{area}")
+                    new_bach[area] = st.number_input(f"{label}: aporte por asistencia ($)", min_value=0, max_value=100000,
+                                                    step=100, value=int(cur_bach[area]), key=f"adm_bach_{selected}_{area}")
             if st.form_submit_button("Guardar montos"):
-                err = set_alfredo(selected, new_alf)
+                err = set_bachero(selected, new_bach)
                 if err:
                     st.error(err)
                 else:
-                    st.session_state["flash"] = f'Montos de Alfredo de "{rec["name"]}" guardados.'
+                    st.session_state["flash"] = f'Montos de Bachero de "{rec["name"]}" guardados.'
                     st.rerun()
 
         render_section_heading("04", "Hacer los cambios permanentes", "Exporta la configuración cifrada para guardarla en los Secrets de Streamlit.")
